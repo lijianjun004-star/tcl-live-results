@@ -1,0 +1,6 @@
+# Working files of dash/refresh.sh. The collector logs contain registry keys, so they must never be committed.
+dash/out/
+dash/runs/
+dash/universal/
+dash/*.log
+dash/*.log.tmp
