@@ -1,0 +1,122 @@
+{
+ "source": {
+  "douyin": "config/probe-targets.json accountName (main)",
+  "tmall": "config/probe-targets.json displayName (main)",
+  "jd": "TCL 运营平台 /api/capture/rooms name，2026-11-12 只读提取"
+ },
+ "names": {
+  "#1": {
+   "name": "TCL官方旗舰店",
+   "role": "考核"
+  },
+  "#2": {
+   "name": "TCL空调总部官方直播间",
+   "role": "考核"
+  },
+  "#3": {
+   "name": "TCL电视官方直播间",
+   "role": "考核"
+  },
+  "#4": {
+   "name": "TCL电视官方",
+   "role": "考核"
+  },
+  "#5": {
+   "name": "TCL空调旗舰店",
+   "role": "监测"
+  },
+  "#6": {
+   "name": "TCL团购官方号",
+   "role": "监测"
+  },
+  "#7": {
+   "name": "FFALCON雷鸟电视旗舰店",
+   "role": "监测"
+  },
+  "T1": {
+   "name": "TCL集团官方旗舰店",
+   "role": "考核"
+  },
+  "T2": {
+   "name": "TCL电视官方旗舰店",
+   "role": "监测"
+  },
+  "T3": {
+   "name": "TCL空调官方旗舰店",
+   "role": "监测"
+  },
+  "T4": {
+   "name": "TCL智能家居旗舰",
+   "role": "监测"
+  },
+  "T5": {
+   "name": "雷鸟电视",
+   "role": "监测"
+  },
+  "T6": {
+   "name": "雷鸟AR眼镜",
+   "role": "监测"
+  },
+  "T7": {
+   "name": "TCL照明官方旗舰",
+   "role": "监测"
+  },
+  "T8": {
+   "name": "TCL户外旗舰店",
+   "role": "监测"
+  },
+  "T9": {
+   "name": "TCL正品专卖店",
+   "role": "监测"
+  },
+  "jd-19": {
+   "name": "京东TCL电视官方旗舰店",
+   "role": "",
+   "opsCategory": "电视",
+   "opsRoom": 19,
+   "asOf": "2026-11-12"
+  },
+  "jd-18": {
+   "name": "TCL显示器京东自营旗舰店",
+   "role": "",
+   "opsCategory": "显示器",
+   "opsRoom": 18,
+   "asOf": "2026-11-12"
+  },
+  "jd-17": {
+   "name": "TCL京东自营旗舰店-电视",
+   "role": "",
+   "opsCategory": "电视",
+   "opsRoom": 17,
+   "asOf": "2026-11-12"
+  },
+  "jd-16": {
+   "name": "TCL官方旗舰店",
+   "role": "",
+   "opsCategory": "全品类",
+   "opsRoom": 16,
+   "asOf": "2026-11-12"
+  },
+  "jd-15": {
+   "name": "TCL京东自营官方旗舰店-空调",
+   "role": "",
+   "opsCategory": "空调",
+   "opsRoom": 15,
+   "asOf": "2026-11-12"
+  },
+  "jd-14": {
+   "name": "TCL京东自营官方旗舰店-洗衣机",
+   "role": "",
+   "opsCategory": "洗衣机",
+   "opsRoom": 14,
+   "asOf": "2026-11-12"
+  },
+  "jd-1": {
+   "name": "TCL京东自营官方旗舰店-冰箱",
+   "role": "",
+   "opsCategory": "空调",
+   "opsRoom": 1,
+   "asOf": "2026-11-12"
+  }
+ }
+}
