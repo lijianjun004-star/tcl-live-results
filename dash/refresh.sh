@@ -6,6 +6,7 @@
 #         universal/index.html                     -> publish to the universal page (HTML artifact)
 # Fails closed: any problem -> non-zero exit, and nothing should be uploaded or published.
 set -u
+set -o pipefail   # a failed gh call inside a pipeline (gh api ... | base64 -d) must fail, not write an empty file
 cd "$(dirname "$0")"
 MAIN_DIR=${MAIN_DIR:-/tmp/mainsrc}; export MAIN_DIR
 R=lijianjun004-star/tcl-live-monitor
