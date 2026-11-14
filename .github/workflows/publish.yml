@@ -1,0 +1,40 @@
+name: Publish result snapshot
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '33 0-17/2 * * *'
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: results-pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Refresh from existing collector logs
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ secrets.RESULTS_READ_TOKEN || github.token }}
+          MAIN_DIR: ${{ runner.temp }}/results-config
+        run: |
+          bash dash/refresh.sh
+          cp dash/universal/index.html docs/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - uses: actions/deploy-pages@v4
+        id: deploy
