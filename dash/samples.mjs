@@ -69,7 +69,7 @@ for (const platform of ['douyin', 'tmall']) {
   }
   out.ok[platform] = ok; out.day[platform] = day || null;
   out.asOf[platform] = mine.length ? hhmm(mine.map(o => o.at).sort().at(-1)) : null;
-  if (ok) for (const o of mine) out.rows.push({ platform, account: label[platform](o.key), date: day, at: hhmm(o.at), pos: pos(o.at), kind: o.kind, api: o.api });
+  if (ok) for (const o of mine) out.rows.push({ platform, account: label[platform](o.key), date: day, at: hhmm(o.at), iso: o.at, pos: pos(o.at), kind: o.kind, api: o.api });
 }
 out.rows.sort((a, b) => a.platform.localeCompare(b.platform) || Number(a.account.replace(/\D/g, '')) - Number(b.account.replace(/\D/g, '')) || a.pos - b.pos);
 fs.writeFileSync('out/samples.json', JSON.stringify(out, null, 1));
