@@ -11,7 +11,8 @@ const keysOf = f => JSON.parse(fs.readFileSync(M + f.replace(/^config\//, ''), '
 const num = s => Number(String(s).replace(/\D+/g, '')) || 0;
 const RES = { BROADCAST_SEEN: '已开播', NOT_SEEN_IN_SAMPLES: '采样中未见（不等于没播）', UNKNOWN: '无法判断' };
 // A stop (verification, 403, 429, login) starts the collectors' 24-hour cooldown; later runs skip sampling until it ends.
-const stopAt = (lines, re) => lines.filter(l => re.test(strip(l))).map(tsOf).filter(Boolean)[0] || null;
+// The probes print 'R316_RPA_STOPPED <json>' / 'R329_TMALL_STOPPED <json>' on every run; the value is null unless the run was stopped.
+const stopLine = (lines, tag) => lines.find(l => { const s = strip(l); if (!s.startsWith(tag + ' ')) return false; try { return !!JSON.parse(s.slice(tag.length + 1)); } catch { return false; } }) || null;
 const pauseOf = t => t ? { from: t, until: new Date(Date.parse(t) + 24 * 3600e3).toISOString() } : null;
 
 const dyKeys = [...keysOf('config/r316-douyin-rpa-targets.json'), ...keysOf('config/r326-douyin-targets-scoring-b.json'), ...keysOf('config/r329-douyin-targets-monitor-c.json'), ...keysOf('config/r329-douyin-targets-monitor-d.json')];
@@ -30,14 +31,16 @@ const rpa = dyLines.map(strip).filter(l => l.startsWith('R316_RPA {')).map(l => 
 const dyAts = rpa.map(r => r.at).sort();
 const dyRows = daily(dyLines).map(d => ({ account: dyLabel(d.key), role: dyKeys.indexOf(d.key) < 4 ? '考核' : '仅监测', date: d.date, result: RES[d.status], seen: span(d.firstSeenAt, d.lastSeenAt), seenFrom: d.firstSeenAt || null, seenTo: d.lastSeenAt || null, samples: d.verifiedSamples }))
   .sort((a, b) => b.date.localeCompare(a.date) || num(a.account) - num(b.account));
-const dyStopped = dyLines.map(strip).some(l => /^R316_RPA_STOPPED \{/.test(l));
-const dyPause = pauseOf(dyStopped ? stopAt(dyLines, /^R316_RPA_STOPPED \{/) || rpa.find(r => r.stop)?.at || null : null);
+const dyStopLine = stopLine(dyLines, 'R316_RPA_STOPPED');
+const dyStopped = !!dyStopLine || rpa.some(r => r.stop);
+const dyPause = pauseOf(dyStopped ? (dyStopLine && tsOf(dyStopLine)) || rpa.find(r => r.stop)?.at || null : null);
 // ---------- Tmall
 const tmLines = L('tm.log');
 const tmRecs = tmLines.map(strip).filter(l => l.startsWith('R329_TMALL {')).map(l => JSON.parse(l.slice(11)));
 const tmTs = tmLines.filter(l => l.includes('R329_TMALL {')).map(tsOf).filter(Boolean).sort();
-const tmStopped = tmLines.map(strip).some(l => l.startsWith('R329_TMALL_STOPPED')) || tmRecs.some(r => String(r.reason || '').startsWith('STOPPED_'));
-const tmPause = pauseOf(tmStopped ? stopAt(tmLines, /^R329_TMALL_STOPPED/) || tmTs.at(-1) || null : null);
+const tmStopLine = stopLine(tmLines, 'R329_TMALL_STOPPED');
+const tmStopped = !!tmStopLine || tmRecs.some(r => String(r.reason || '').startsWith('STOPPED_'));
+const tmPause = pauseOf(tmStopped ? (tmStopLine && tsOf(tmStopLine)) || tmTs.at(-1) || null : null);
 const tmDaily = daily(tmLines);
 const tmLatest = tmDaily.map(d => d.date).sort().pop();
 const nowText = r => !r ? '—' : r.state === 'LIVE' ? '在播' + (r.sourceStartTime ? ' · ' + hhmm(r.sourceStartTime) + ' 开始' : '') : r.state === 'OFFLINE' ? '接口显示未开播' : r.state === 'NOT_RUN' ? '未执行' : '无法判断';
