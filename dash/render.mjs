@@ -36,6 +36,8 @@ const genIso = new Date().toISOString(), latestIso = runs.map(r => r.atTo || r.a
 const genText = bjParts(genIso).date.slice(0, 4) + '年' + longAt(genIso);
 const gapH = latestIso ? (Date.parse(genIso) - Date.parse(latestIso)) / 3600e3 : 0;
 const nextSlot = (() => { const t = Date.parse(genIso), d = new Date(t), m = d.getUTCMinutes(); const add = m < 3 ? 3 - m : m < 33 ? 33 - m : 63 - m; return bjParts(t + add * 60e3 - d.getUTCSeconds() * 1000).hm; })();
+const pauses = { douyin: runs[1].pause || null, tmall: runs[2].pause || null };
+const paused = p => !!pauses[p] && Date.parse(pauses[p].until) > Date.parse(genIso);
 const dyDate = latest(dyAll), tmDate = latest(tmAll), day = dyDate > tmDate ? dyDate : tmDate;
 const CATS = ['冰箱', '洗衣机', '空调', '电视', '显示器'];
 
@@ -49,11 +51,12 @@ for (const [p, pl, all, key, date] of [['douyin', '抖音', dyAll, 'account', dy
     const off = smp.filter(s => s.kind === 'notseen'), apiOff = off.length > 0 && off.every(s => s.api === 'OFFLINE');
     const start = p === 'tmall' && String(r.now).startsWith('在播') ? (r.nowStart ? at(r.nowStart, date) : startOf(r.now)) : null;
     const seenTxt = spanAt(r.seenFrom, r.seenTo, date) || r.seen;
+    const pz = paused(p) ? pauses[p] : null, pzLine = pz ? `平台要求验证，${at(pz.from, date)} 起暂停采样，${longAt(pz.until)} 恢复` : '';
     const line = st === 'seen' ? `看到在播 ${seenTxt}${start ? `，本场 ${start} 开始` : ''}`
       : st === 'unseen' ? (apiOff ? `${r.samples} 次采样，接口都显示未开播` : `${r.samples} 次采样都没看到在播`) : '没有核验通过的采样';
     const prev = prevOf(all, key, code, date);
     R.push({ id: slug(code), code, p, pl, name: nameOf(code), role: roleOf(code), st, status: st === 'seen' ? '已开播' : st === 'unseen' ? '采样中未见' : '无法判断',
-      line, lineWarn: false, line2: '', attn: st === 'seen' ? [] : [st === 'unseen' ? '采样中未见' : '无法判断'], date, seen: st === 'seen' ? seenTxt : '', start: start || '', seenFrom: st === 'seen' ? r.seenFrom || null : null, seenTo: st === 'seen' ? r.seenTo || null : null, startIso: r.nowStart || null,
+      line: pz && st !== 'seen' && !r.samples ? pzLine : line, lineWarn: false, line2: pz && (st === 'seen' || r.samples) ? pzLine : '', attn: [...(st === 'seen' ? [] : [st === 'unseen' ? '采样中未见' : '无法判断']), ...(pz ? ['暂停采样'] : [])], date, seen: st === 'seen' ? seenTxt : '', start: start || '', seenFrom: st === 'seen' ? r.seenFrom || null : null, seenTo: st === 'seen' ? r.seenTo || null : null, startIso: r.nowStart || null,
       samples: r.samples, smp, prev: prev ? `${short(prev.date)}：${prev.result === SEEN ? '已开播，看到在播 ' + (spanAt(prev.seenFrom, prev.seenTo, prev.date) || prev.seen) : prev.result}，核验 ${prev.samples} 次` : '' });
   }
 }
@@ -72,7 +75,11 @@ const by = p => R.filter(r => r.p === p);
 const seenAll = R.filter(r => r.st === 'seen').length, attnAll = R.filter(r => r.attn.length).length;
 const title = seenAll === R.length ? `${R.length} 个直播间都开播了` : `${R.length} 个直播间里 ${seenAll} 个开播了`;
 const dekParts = [];
-for (const [p, pl, unit] of [['douyin', '抖音', '个账号'], ['tmall', '天猫淘宝', '家']]) { const n = by(p).filter(r => r.st !== 'seen').length; if (n) dekParts.push(`${pl} ${n} ${unit}采样中未见`); }
+for (const [p, pl, unit] of [['douyin', '抖音', '个账号'], ['tmall', '天猫淘宝', '家']]) {
+  const un = by(p).filter(r => r.st === 'unseen').length, uk = by(p).filter(r => r.st === 'unknown').length;
+  const parts = [un ? `${un} ${unit}采样中未见` : '', uk ? `${uk} ${unit}${paused(p) ? '暂停采样，无法判断' : '无法判断'}` : ''].filter(Boolean);
+  if (parts.length) dekParts.push(`${pl} ${parts.join('，')}`);
+}
 const late8 = by('jd').filter(r => r.live8 === '否').length;
 if (late8) dekParts.push(`京东 ${late8} 家 8 点时还没在播`);
 const dek = dekParts.length ? dekParts.join('；') + '。' : '没有需要关注的直播间。';
@@ -154,6 +161,7 @@ button{font:inherit;color:inherit}
 .wrap{max-width:860px;margin:0 auto;padding:0 16px}
 header{padding:20px 0 0}
 .meta{margin:0;font-size:13px;color:var(--mut)}
+.pause{margin:6px 0 0;font-size:13px;font-weight:600;color:var(--warn)}
 h1{margin:6px 0 0;font-size:clamp(24px,6.4vw,34px);line-height:1.25;font-weight:700;text-wrap:balance}
 .dek{margin:8px 0 0;font-size:15px;text-wrap:balance}
 .board{margin:16px 0 0;padding:12px 12px 8px;background:var(--plate);border-radius:16px}
@@ -257,7 +265,7 @@ footer{margin:18px 0 0;padding:14px 0 30px;border-top:1px solid var(--line);font
 <body>
 <div class="wrap">
 <header>
-<p class="meta">${esc(md(day))}（${esc(wk(day))}）的直播结果　数据截至 ${esc(latestIso ? longAt(latestIso) : '—')}（北京时间），不是实时${gapH >= 3 ? `，此后约 ${Math.floor(gapH)} 小时没有新的采样` : ''}</p>
+<p class="meta">${esc(md(day))}（${esc(wk(day))}）的直播结果　数据截至 ${esc(latestIso ? longAt(latestIso) : '—')}（北京时间），不是实时${gapH >= 3 ? `，此后约 ${Math.floor(gapH)} 小时没有新的采样` : ''}</p>${['douyin', 'tmall'].filter(paused).map(p => `<p class="pause">${p === 'douyin' ? '抖音' : '天猫淘宝'}：${esc(longAt(pauses[p].from))} 平台要求验证，按规则暂停采样到 ${esc(longAt(pauses[p].until))}，这期间结果是「无法判断」。</p>`).join('')}
 <h1>${esc(title)}</h1>
 <p class="dek">${esc(dek)}</p>
 <div class="board" aria-label="每个直播间当天的开播情况，点一下跳到对应店铺">

@@ -10,6 +10,9 @@ const span = (a, b) => !a ? '—' : (hhmm(a) === hhmm(b) || !b) ? hhmm(a) : hhmm
 const keysOf = f => JSON.parse(fs.readFileSync(M + f.replace(/^config\//, ''), 'utf8')).targets.map(t => t.key);
 const num = s => Number(String(s).replace(/\D+/g, '')) || 0;
 const RES = { BROADCAST_SEEN: '已开播', NOT_SEEN_IN_SAMPLES: '采样中未见（不等于没播）', UNKNOWN: '无法判断' };
+// A stop (verification, 403, 429, login) starts the collectors' 24-hour cooldown; later runs skip sampling until it ends.
+const stopAt = (lines, re) => lines.filter(l => re.test(strip(l))).map(tsOf).filter(Boolean)[0] || null;
+const pauseOf = t => t ? { from: t, until: new Date(Date.parse(t) + 24 * 3600e3).toISOString() } : null;
 
 const dyKeys = [...keysOf('config/r316-douyin-rpa-targets.json'), ...keysOf('config/r326-douyin-targets-scoring-b.json'), ...keysOf('config/r329-douyin-targets-monitor-c.json'), ...keysOf('config/r329-douyin-targets-monitor-d.json')];
 const tmKeys = JSON.parse(fs.readFileSync(M + 'probe-targets.json', 'utf8')).tmall.map(t => t.key);
@@ -28,10 +31,13 @@ const dyAts = rpa.map(r => r.at).sort();
 const dyRows = daily(dyLines).map(d => ({ account: dyLabel(d.key), role: dyKeys.indexOf(d.key) < 4 ? '考核' : '仅监测', date: d.date, result: RES[d.status], seen: span(d.firstSeenAt, d.lastSeenAt), seenFrom: d.firstSeenAt || null, seenTo: d.lastSeenAt || null, samples: d.verifiedSamples }))
   .sort((a, b) => b.date.localeCompare(a.date) || num(a.account) - num(b.account));
 const dyStopped = dyLines.map(strip).some(l => /^R316_RPA_STOPPED \{/.test(l));
+const dyPause = pauseOf(dyStopped ? stopAt(dyLines, /^R316_RPA_STOPPED \{/) || rpa.find(r => r.stop)?.at || null : null);
 // ---------- Tmall
 const tmLines = L('tm.log');
 const tmRecs = tmLines.map(strip).filter(l => l.startsWith('R329_TMALL {')).map(l => JSON.parse(l.slice(11)));
 const tmTs = tmLines.filter(l => l.includes('R329_TMALL {')).map(tsOf).filter(Boolean).sort();
+const tmStopped = tmLines.map(strip).some(l => l.startsWith('R329_TMALL_STOPPED')) || tmRecs.some(r => String(r.reason || '').startsWith('STOPPED_'));
+const tmPause = pauseOf(tmStopped ? stopAt(tmLines, /^R329_TMALL_STOPPED/) || tmTs.at(-1) || null : null);
 const tmDaily = daily(tmLines);
 const tmLatest = tmDaily.map(d => d.date).sort().pop();
 const nowText = r => !r ? '—' : r.state === 'LIVE' ? '在播' + (r.sourceStartTime ? ' · ' + hhmm(r.sourceStartTime) + ' 开始' : '') : r.state === 'OFFLINE' ? '接口显示未开播' : r.state === 'NOT_RUN' ? '未执行' : '无法判断';
@@ -59,8 +65,8 @@ const jdRows = ids.map(id => {
 // Douyin 'verified' uses the daily-ledger rule (profile identity checked); the room itself can only be checked while it is live.
 const runsRows = [
   { platform: '京东', asOf: hhmm(jdAt), atFrom: jdAt || null, atTo: jdAt || null, checked: jdFull.rooms, reachable: jdFull.dailyOk, verified: '—', note: '运营平台只读，读每日分钟数' },
-  { platform: '抖音', asOf: span(dyAts[0], dyAts.at(-1)), atFrom: dyAts[0] || null, atTo: dyAts.at(-1) || null, checked: rpa.length, reachable: rpa.filter(r => r.profileHttp === 200).length, verified: rpa.filter(r => r.state !== 'NOT_RUN' && r.profileIdentityVerified).length, note: dyStopped ? '本次被拦停' : '没有被拦，没有进入冷却' },
-  { platform: '天猫淘宝', asOf: span(tmTs[0], tmTs.at(-1)), atFrom: tmTs[0] || null, atTo: tmTs.at(-1) || null, checked: tmRecs.length, reachable: tmRecs.filter(r => r.http === 200).length, verified: tmRecs.filter(r => r.identityVerified).length, note: tmRecs.some(r => r.state === 'NOT_RUN') ? '本次被拦停' : '没有被拦，没有进入冷却' },
+  { platform: '抖音', asOf: span(dyAts[0], dyAts.at(-1)), atFrom: dyAts[0] || null, atTo: dyAts.at(-1) || null, checked: rpa.length, reachable: rpa.filter(r => r.profileHttp === 200).length, verified: rpa.filter(r => r.state !== 'NOT_RUN' && r.profileIdentityVerified).length, pause: dyPause, note: dyStopped ? '平台要求验证，按规则暂停 24 小时' : '没有被拦，没有进入冷却' },
+  { platform: '天猫淘宝', asOf: span(tmTs[0], tmTs.at(-1)), atFrom: tmTs[0] || null, atTo: tmTs.at(-1) || null, checked: tmRecs.length, reachable: tmRecs.filter(r => r.http === 200).length, verified: tmRecs.filter(r => r.identityVerified).length, pause: tmPause, note: tmStopped ? '平台要求验证，按规则暂停 24 小时' : '没有被拦，没有进入冷却' },
 ];
 if (!jdRows.length || !dyRows.length || !tmRows.length || !rpa.length || !tmRecs.length) throw new Error('EMPTY_DATASET jd=' + jdRows.length + ' dy=' + dyRows.length + ' tm=' + tmRows.length + ' rpa=' + rpa.length + ' tmRecs=' + tmRecs.length);
 fs.mkdirSync('out', { recursive: true });

@@ -24,8 +24,9 @@ pick() {
 }
 
 JD=$(pick 417538022 'R327_JD_DAY ' jd.log) || { echo "NO_JD_RUN_WITH_DATA"; exit 1; }
-DY=$(pick 417529171 'R325_DAILY {' dy.log) || { echo "NO_DOUYIN_RUN_WITH_DATA"; exit 1; }
-TM=$(pick 417885046 'R325_DAILY {' tm.log) || { echo "NO_TMALL_RUN_WITH_DATA"; exit 1; }
+# A run skipped by the 24-hour cooldown still prints the ledger but samples nothing: use the newest run that sampled.
+DY=$(pick 417529171 'R316_RPA {' dy.log) || { echo "NO_DOUYIN_RUN_WITH_DATA"; exit 1; }
+TM=$(pick 417885046 'R329_TMALL {' tm.log) || { echo "NO_TMALL_RUN_WITH_DATA"; exit 1; }
 echo "runs: jd=$JD douyin=$DY tmall=$TM"
 
 # Registry config from main: used by the leak check, and by names.mjs for the store names shown on the universal page.
