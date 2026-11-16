@@ -54,15 +54,25 @@ const jdFull = JSON.parse(strip(jdLines.find(l => l.includes('R327_JD_FULLDAY ')
 // JD follows the broadcast day the Douyin/Tmall results show, so one page never mixes two days
 // (a JD run after midnight, or the 08:02 snapshot before the first Douyin/Tmall sample of the day).
 const pageDay = [...dyRows.map(r => r.date), ...tmRows.map(r => r.date)].sort().at(-1);
-const dates = [...new Set(jd.map(r => r.date))].sort(), today = dates.includes(pageDay) ? pageDay : dates.at(-1), prevDate = dates.filter(d => d < today).at(-1);
+const dates = [...new Set(jd.map(r => r.date))].sort(), today = dates.includes(pageDay) ? pageDay : dates.at(-1);
+if (!today) throw new Error('JD_DAILY_DATA_MISSING');
+// Do not relabel an older record as the previous calendar day.
+const prevDate = new Date(Date.parse(today + 'T00:00:00Z') - 864e5).toISOString().slice(0, 10);
 const pct = a => a[0] === a[1] ? a[0] + '%' : a[0] + '%–' + a[1] + '%';
 const ids = [...new Set(jd.map(r => r.roomId))].sort((a, b) => a - b);
 const jdRows = ids.map(id => {
   const t = jd.find(r => r.roomId === id && r.date === today), p = jd.find(r => r.roomId === id && r.date === prevDate);
-  const snap = p.method === 'FROM_0800_SNAPSHOT';
-  return { room: 'jd-' + id, category: t.category, todayDate: today, live8: t.liveByWindowStart === true ? '是' : t.liveByWindowStart === false ? '否' : '—', minutesToday: t.soFarMinutes ?? t.totalDayMinutes, dayRate: t.method === 'FROM_0800_SNAPSHOT' && t.ratePercent != null ? t.ratePercent + '%' : '',
-    prevDate, prevRate: snap ? p.ratePercent + '%' : p.routineAssumedRangePercent ? pct(p.routineAssumedRangePercent) : '—', prevBasis: snap ? '按 8 点快照计算' : '估算（无 8 点快照）',
-    prevMinutes: p.totalDayMinutes, prevLast: p.lastMinuteBeijing ?? '—', prevEnd: p.reachedWindowEnd === true ? '播到 24 点' : p.reachedWindowEnd === false ? '没播到 24 点' : '—' };
+  const snap = p?.method === 'FROM_0800_SNAPSHOT' && Number.isFinite(p.ratePercent);
+  const range = Array.isArray(p?.routineAssumedRangePercent) && p.routineAssumedRangePercent.length === 2 && p.routineAssumedRangePercent.every(Number.isFinite);
+  return { room: 'jd-' + id, category: t?.category ?? p?.category ?? jd.find(r => r.roomId === id)?.category ?? '—', todayDate: today,
+    todayMissing: !t, previousMissing: !p,
+    live8: t?.liveByWindowStart === true ? '是' : t?.liveByWindowStart === false ? '否' : '—',
+    minutesToday: t?.soFarMinutes ?? t?.totalDayMinutes ?? null,
+    dayRate: t?.method === 'FROM_0800_SNAPSHOT' && Number.isFinite(t.ratePercent) ? t.ratePercent + '%' : '',
+    prevDate, prevRate: snap ? p.ratePercent + '%' : range ? pct(p.routineAssumedRangePercent) : '—',
+    prevBasis: !p ? '无上一日记录' : snap ? '按 8 点快照计算' : range ? '估算（无 8 点快照）' : '无可用上一日结果',
+    prevMinutes: p?.totalDayMinutes ?? null, prevLast: p?.lastMinuteBeijing ?? '—',
+    prevEnd: p?.reachedWindowEnd === true ? '播到 24 点' : p?.reachedWindowEnd === false ? '没播到 24 点' : '—' };
 });
 // ---------- runs
 // Douyin 'verified' uses the daily-ledger rule (profile identity checked); the room itself can only be checked while it is live.
