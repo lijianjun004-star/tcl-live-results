@@ -14,9 +14,11 @@ R=lijianjun004-star/tcl-live-monitor
 # pick WORKFLOW_ID GREP_PATTERN OUTFILE : newest successful run whose log matches; log saved to OUTFILE.
 # (log goes to a file first: `gh ... | grep -q` under pipefail breaks on SIGPIPE)
 pick() {
-  local wf="$1" pat="$2" out="$3" id
-  for id in $(gh api "repos/$R/actions/workflows/$wf/runs?per_page=8&status=success" --jq '.workflow_runs[].id'); do
-    gh run view "$id" -R "$R" --log > "$out.tmp" 2>/dev/null || continue
+  local wf="$1" pat="$2" out="$3" id ids
+  # Eight runs can all be cooldown/no-sample runs. Search up to 100 MAIN runs.
+  ids=$(gh api "repos/$R/actions/workflows/$wf/runs?per_page=100&status=success&branch=main" --jq '.workflow_runs[].id') || { echo "RUN_LIST_FAILED workflow=$wf" >&2; return 1; }
+  for id in $ids; do
+    gh run view "$id" -R "$R" --log > "$out.tmp" 2>/dev/null || { echo "LOG_UNAVAILABLE run=$id" >&2; continue; }
     if grep -q -- "$pat" "$out.tmp"; then mv "$out.tmp" "$out"; echo "$id"; return 0; fi
   done
   rm -f "$out.tmp"
@@ -45,7 +47,7 @@ console.log(new Date(Date.parse(d+"T06:00:00+08:00")-15*60e3).toISOString().slic
 rm -rf runs && mkdir -p runs
 for pair in dy:417529171 tm:417885046; do
   p=${pair%%:*}; wf=${pair##*:}
-  for id in $(gh api "repos/$R/actions/workflows/$wf/runs?per_page=30&status=success&created=>=$SINCE" --jq '.workflow_runs[].id'); do
+  for id in $(gh api "repos/$R/actions/workflows/$wf/runs?per_page=100&status=success&branch=main&created=>=$SINCE" --jq '.workflow_runs[].id'); do
     gh run view "$id" -R "$R" --log > "runs/$p-$id.log" 2>/dev/null || { echo "LOG_FETCH_FAILED $id"; rm -f "runs/$p-$id.log"; }
   done
 done
