@@ -3,6 +3,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      collector_run_id:
+        description: 'Optional monitor collector run that requested this refresh'
+        required: false
+        type: string
+      dispatcher_run_id:
+        description: 'Optional monitor refresh-dispatch run'
+        required: false
+        type: string
   schedule:
     - cron: '3,33 * * * *'   # every 30 minutes, around the clock (Beijing :03 and :33)
 permissions:
@@ -28,6 +37,7 @@ jobs:
       # never put the old committed snapshot back online. If the refresh fails, the job stops here: nothing is
       # uploaded or deployed and the last good page stays online.
       - name: Refresh from existing collector logs
+        id: refresh
         env:
           GH_TOKEN: ${{ secrets.RESULTS_READ_TOKEN || github.token }}
           MAIN_DIR: ${{ runner.temp }}/results-config
@@ -40,3 +50,28 @@ jobs:
           path: docs
       - uses: actions/deploy-pages@v5
         id: deploy
+      - name: Record actual publication outcome
+        if: always()
+        env:
+          REFRESH_OUTCOME: ${{ steps.refresh.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          PUBLISHED_URL: ${{ steps.deploy.outputs.page_url }}
+          COLLECTOR_RUN_ID: ${{ inputs.collector_run_id || '' }}
+          DISPATCHER_RUN_ID: ${{ inputs.dispatcher_run_id || '' }}
+        run: |
+          # Treat workflow inputs as data; only numeric run IDs enter logs or links.
+          [[ "${COLLECTOR_RUN_ID:-}" =~ ^[0-9]+$ ]] || COLLECTOR_RUN_ID=''
+          [[ "${DISPATCHER_RUN_ID:-}" =~ ^[0-9]+$ ]] || DISPATCHER_RUN_ID=''
+          if [ "$REFRESH_OUTCOME" = success ] && [ "$DEPLOY_OUTCOME" = success ] && [ -n "$PUBLISHED_URL" ]; then
+            printf 'RESULTS_PUBLICATION {"status":"PUBLISHED","collectorRunId":"%s","dispatcherRunId":"%s"}\n' "$COLLECTOR_RUN_ID" "$DISPATCHER_RUN_ID"
+            printf '### 结果站发布\n\n状态：**PUBLISHED**。采集日志刷新及 Pages 部署均成功。\n\n页面：%s\n' "$PUBLISHED_URL" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'RESULTS_PUBLICATION {"status":"NOT_PUBLISHED"}'
+            printf '### 结果站发布\n\n状态：**NOT_PUBLISHED**。本次未确认新页面发布成功；请检查刷新或部署步骤。采集结果的新鲜度须按页面各平台时间判断。\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "$COLLECTOR_RUN_ID" ]; then
+            printf '\n触发本次刷新的采集：[运行 %s](https://github.com/lijianjun004-star/tcl-live-monitor/actions/runs/%s)。这不是各平台实际数据的采样时间。\n' "$COLLECTOR_RUN_ID" "$COLLECTOR_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "$DISPATCHER_RUN_ID" ]; then
+            printf '\n对应派发：[运行 %s](https://github.com/lijianjun004-star/tcl-live-monitor/actions/runs/%s)。\n' "$DISPATCHER_RUN_ID" "$DISPATCHER_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+          fi

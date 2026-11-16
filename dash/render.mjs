@@ -3,6 +3,7 @@
 // Inputs: out/{jd,douyin,tmall,runs,samples}.json and private/names.json (optional; falls back to codes).
 // Output: universal/index.html.   Usage: node render.mjs   (NEXT_REFRESH="11-15 09:10" adds a refresh note)
 import fs from 'node:fs';
+import { assessFreshness } from './freshness.mjs';
 const rd = f => JSON.parse(fs.readFileSync('out/' + f, 'utf8'));
 const jdAll = rd('jd.json').rows, dyAll = rd('douyin.json').rows, tmAll = rd('tmall.json').rows, runs = rd('runs.json').rows, S = rd('samples.json');
 let N = {}, namesOk = true;
@@ -32,7 +33,9 @@ const nameOf = c => N[c]?.name || c, roleOf = c => N[c]?.role || '';
 const startOf = t => (String(t).match(/(\d\d:\d\d) 开始/) || [])[1];
 const lastOf = t => String(t).split('–').at(-1);
 const asOf = { douyin: lastOf(runs[1].asOf), tmall: lastOf(runs[2].asOf), jd: lastOf(runs[0].asOf) };
-const genIso = new Date().toISOString(), latestIso = runs.map(r => r.atTo || r.atFrom).filter(Boolean).sort().at(-1) || null;
+const validSourceTime = r => { const t = r.atTo || r.atFrom; return typeof t === 'string' && Number.isFinite(Date.parse(t)) ? t : null; };
+const genIso = new Date().toISOString(), latestIso = runs.map(validSourceTime).filter(Boolean).sort().at(-1) || null;
+const sourceAt = { jd: validSourceTime(runs[0]), douyin: validSourceTime(runs[1]), tmall: validSourceTime(runs[2]) };
 const genText = bjParts(genIso).date.slice(0, 4) + '年' + longAt(genIso);
 const gapH = latestIso ? (Date.parse(genIso) - Date.parse(latestIso)) / 3600e3 : 0;
 const nextSlot = (() => { const t = Date.parse(genIso), d = new Date(t), m = d.getUTCMinutes(); const add = m < 3 ? 3 - m : m < 33 ? 33 - m : 63 - m; return bjParts(t + add * 60e3 - d.getUTCSeconds() * 1000).hm; })();
@@ -61,14 +64,16 @@ for (const [p, pl, all, key, date] of [['douyin', '抖音', dyAll, 'account', dy
   }
 }
 for (const r of [...jdAll].sort((a, b) => num(a.room) - num(b.room))) {
-  const code = r.room, name = nameOf(code), est = r.prevBasis.startsWith('估算'), m = Number(r.minutesToday) || 0;
+  const code = r.room, name = nameOf(code), est = r.prevBasis.startsWith('估算');
+  const m = Number.isFinite(r.minutesToday) && r.minutesToday >= 0 ? r.minutesToday : null;
+  const missing = r.todayMissing === true || m === null;
   const late = r.live8 === '否', short24 = r.prevEnd === '没播到 24 点';
   const inName = CATS.find(c => name.includes(c));
-  R.push({ id: slug(code), code, p: 'jd', pl: '京东', name, role: '', st: m > 0 ? 'seen' : 'unseen', status: m > 0 ? '已开播' : '当天还没有数据',
-    line: `${r.live8 === '是' ? '8 点在播' : late ? '8 点时还没在播' : '8 点没有快照'}，当天累计 ${m} 分钟`, lineWarn: late,
-    line2: r.dayRate ? `${short(r.todayDate)} 满播率 ${r.dayRate}（按 8 点快照）` : `${short(r.prevDate)} 满播率 ${r.prevRate}${est ? '（估算）' : ''}`,
-    attn: [late ? '8 点时还没在播' : '', short24 ? `${short(r.prevDate)} 没播到 24 点` : ''].filter(Boolean),
-    date: r.todayDate, live8: r.live8, minutes: m, dayRate: r.dayRate || '', prevDate: r.prevDate, prevRate: r.prevRate, est, prevLast: r.prevLast, prevEnd: r.prevEnd,
+  R.push({ id: slug(code), code, p: 'jd', pl: '京东', name, role: '', st: missing ? 'unknown' : m > 0 ? 'seen' : 'unseen', status: missing ? '当天数据缺失，无法判断' : m > 0 ? '已开播' : '当天累计 0 分钟',
+    line: missing ? '本日没有可用分钟记录，不能判断是否开播' : `${r.live8 === '是' ? '8 点在播' : late ? '8 点时还没在播' : '8 点没有快照'}，当天累计 ${m} 分钟`, lineWarn: missing || late,
+    line2: r.dayRate ? `${short(r.todayDate)} 满播率 ${r.dayRate}（按 8 点快照）` : r.previousMissing ? `${short(r.prevDate)} 没有记录，不计算上一日满播率` : `${short(r.prevDate)} 满播率 ${r.prevRate}${est ? '（估算）' : ''}`,
+    attn: [missing ? '当天数据缺失' : '', late ? '8 点时还没在播' : '', short24 ? `${short(r.prevDate)} 没播到 24 点` : ''].filter(Boolean),
+    date: r.todayDate, live8: r.live8, minutes: m, dayRate: r.dayRate || '', prevDate: r.prevDate, prevRate: r.prevRate, previousMissing: r.previousMissing, prevBasis: r.prevBasis, est, prevLast: r.prevLast, prevEnd: r.prevEnd,
     room: num(code), category: r.category, conflict: inName && r.category && inName !== r.category ? inName : '' });
 }
 const by = p => R.filter(r => r.p === p);
@@ -105,7 +110,7 @@ const jdMore = r => {
   const v = rate(r.prevRate);
   const bar = v ? `<div class="bar" aria-hidden="true"><i class="lo" style="width:${v[0]}%"></i>${v[1] > v[0] ? `<i class="hi" style="left:${v[0]}%;width:${(v[1] - v[0]).toFixed(1)}%"></i>` : ''}</div>` : '';
   return `<div class="rate"><span>${esc(short(r.prevDate))} 满播率</span>${bar}<b>${esc(r.prevRate)}</b></div>
-<ul class="facts"><li>${r.est ? `${esc(short(r.prevDate))} 没有 8 点快照，只能按「7–8 点开播」估算范围，斜纹是不确定的部分` : '按 8 点快照计算'}</li>
+<ul class="facts"><li>${r.previousMissing ? '没有上一日记录，不推算满播率或停播状态' : r.est ? `${esc(short(r.prevDate))} 没有 8 点快照，只能按「7–8 点开播」估算范围，斜纹是不确定的部分` : esc(r.prevBasis)}</li>
 <li>${esc(short(r.prevDate))} 最后一分钟 ${esc(r.prevLast)}${r.prevEnd === '没播到 24 点' ? '，没播到 24 点' : r.prevEnd === '播到 24 点' ? '，播到了 24 点' : ''}</li>
 <li>运营平台 ${r.room} 号直播间，品类「${esc(r.category)}」${r.conflict ? `（和名称里的「${esc(r.conflict)}」不一致，待运营平台核实）` : ''}</li></ul>`;
 };
@@ -119,17 +124,21 @@ const row = r => {
 <div class="more">${r.p === 'jd' ? jdMore(r) : strip(r) + (r.prev ? `<p class="fine">前一天 ${esc(r.prev)}</p>` : '')}<p class="fine">监控编号 ${esc(r.code)}</p></div>
 </details>`;
 };
-const group = (p, pl) => `<section class="grp" data-p="${p}" aria-labelledby="g-${p}"><h2 id="g-${p}">${pl}<span>${esc(groupMeta(p))}</span></h2>${by(p).map(row).join('')}</section>`;
+const group = (p, pl) => {
+  const freshness = assessFreshness(sourceAt[p], Date.parse(genIso));
+  return `<section class="grp" data-p="${p}" aria-labelledby="g-${p}"><h2 id="g-${p}">${pl}<span>${esc(groupMeta(p))}</span></h2><p class="fine">本平台数据截至 ${esc(sourceAt[p] ? longAt(sourceAt[p]) : '时间无法确认')}（北京时间） · <span data-source-time="${esc(sourceAt[p] || '')}" data-age-state="${freshness.state}">${esc(freshness.text)}</span></p>${by(p).map(row).join('')}</section>`;
+};
 
 // data for copy-to-record (names, results and times only)
 const recs = R.map(r => {
   const extra = r.p === 'jd' ? r.attn.filter(a => a.includes('24 点')) : [];
   return { id: r.id, p: r.pl, name: r.name, role: r.role, status: r.status, date: r.date,
-    text: r.status + '，' + r.line + (r.line2 ? '；' + r.line2 : '') + (extra.length ? '；' + extra.join('，') : ''),
+    text: r.status + '，' + r.line + (r.line2 ? '；' + r.line2 : '') + (extra.length ? '；' + extra.join('，') : '') + '；数据截至 ' + (sourceAt[r.p] ? isoBJ(sourceAt[r.p]) : '时间无法确认'),
+    asOfIso: sourceAt[r.p] ? isoBJ(sourceAt[r.p]) : '',
     seen: r.seen || '', start: r.startIso ? isoBJ(r.startIso) : r.start || '', seenFrom: isoBJ(r.seenFrom), seenTo: isoBJ(r.seenTo), live8: r.p === 'jd' ? (r.live8 === '是' ? '是' : r.live8 === '否' ? '否' : '') : '', minutes: r.p === 'jd' ? r.minutes : '',
     prevRate: r.p === 'jd' ? r.prevRate + (r.est ? '（估算）' : '') : '', dayRate: r.p === 'jd' ? r.dayRate : '', note: r.attn.join('；') };
 });
-const recJson = JSON.stringify({ day, head: `TCL 直播记录 ${md(day)}（${wk(day)}）`, asOf: '数据截至 ' + (latestIso ? longAt(latestIso) : '—') + '（北京时间，不是实时）', asOfIso: latestIso ? isoBJ(latestIso) : '', rows: recs }).replace(/</g, '\\u003c');
+const recJson = JSON.stringify({ day, head: `TCL 直播记录 ${md(day)}（${wk(day)}）`, asOf: '各平台时间见每条记录；最新一份采样 ' + (latestIso ? longAt(latestIso) : '—') + '（北京时间，不是实时）', asOfIso: latestIso ? isoBJ(latestIso) : '', rows: recs }).replace(/</g, '\\u003c');
 const runRow = r => `<tr><td>${esc(r.platform)}</td><td class="n tm">${esc(runSpan(r)).split(' ').map(x => `<span>${x}</span>`).join(' ')}</td><td class="n">${r.reachable === '—' ? '—' : esc(r.reachable) + '/' + esc(r.checked)}</td><td class="n">${r.verified === '—' ? '—' : esc(r.verified) + '/' + esc(r.checked)}</td></tr>`;
 
 const DARK = '--bg:#0e1a21;--ink:#e8eef2;--mut:#9aacb6;--line:#22343d;--plate:#132630;--wash:#1a313c;--on:#ff4d6d;--glow:rgba(255,77,109,.28);--off:#5b7480;--warn:#eaa25f;--sel:#e8eef2;--selink:#0e1a21;--nav:rgba(14,26,33,.9);--grid:#2a404a;--fut:#132a35;--sea:#6cc3de;--seahi:rgba(108,195,222,.35)';
@@ -235,6 +244,7 @@ h1{margin:6px 0 0;font-size:clamp(24px,6.4vw,34px);line-height:1.25;font-weight:
 .smp li{display:inline-flex;align-items:center;margin:0 14px 4px 0;white-space:nowrap}
 .smp b{margin-right:4px;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
 .fine{margin:8px 0 0;font-size:13px;color:var(--mut)}
+[data-age-state=STALE],[data-age-state=UNKNOWN]{color:var(--warn);font-weight:600}
 .rate{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-column-gap:10px;align-items:center;font-size:13px;color:var(--mut)}
 .rate b{color:var(--ink);font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bar{position:relative;height:8px;border-radius:4px;background:var(--wash);overflow:hidden}
@@ -265,7 +275,7 @@ footer{margin:18px 0 0;padding:14px 0 30px;border-top:1px solid var(--line);font
 <body>
 <div class="wrap">
 <header>
-<p class="meta">${esc(md(day))}（${esc(wk(day))}）的直播结果　数据截至 ${esc(latestIso ? longAt(latestIso) : '—')}（北京时间），不是实时${gapH >= 3 ? `，此后约 ${Math.floor(gapH)} 小时没有新的采样` : ''}</p>${['douyin', 'tmall'].filter(paused).map(p => `<p class="pause">${p === 'douyin' ? '抖音' : '天猫淘宝'}：${esc(longAt(pauses[p].from))} 平台要求验证，按规则暂停采样到 ${esc(longAt(pauses[p].until))}，这期间结果是「无法判断」。</p>`).join('')}
+<p class="meta">${esc(md(day))}（${esc(wk(day))}）的直播结果　最新一份采样 ${esc(latestIso ? longAt(latestIso) : '—')}（北京时间），各平台时间见下方，不是实时${gapH >= 3 ? `，此后约 ${Math.floor(gapH)} 小时没有新的采样` : ''}</p>${['douyin', 'tmall'].filter(paused).map(p => `<p class="pause">${p === 'douyin' ? '抖音' : '天猫淘宝'}：${esc(longAt(pauses[p].from))} 平台要求验证，按规则暂停采样到 ${esc(longAt(pauses[p].until))}，这期间结果是「无法判断」。</p>`).join('')}
 <h1>${esc(title)}</h1>
 <p class="dek">${esc(dek)}</p>
 <div class="board" aria-label="每个直播间当天的开播情况，点一下跳到对应店铺">
@@ -304,6 +314,18 @@ ${group('jd', '京东')}
 </div>
 <script type="application/json" id="rec">${recJson}</script>
 <script>
+// Re-evaluate each platform's age while the page is open; no network requests.
+const assessFreshness = ${assessFreshness.toString()};
+function updateSourceAges() {
+  document.querySelectorAll('[data-source-time]').forEach(function (node) {
+    const value = assessFreshness(node.getAttribute('data-source-time'));
+    node.textContent = value.text;
+    node.setAttribute('data-age-state', value.state);
+  });
+}
+updateSourceAges();
+setInterval(updateSourceAges, 60000);
+document.addEventListener('visibilitychange', updateSourceAges);
 {
   const doc = document.documentElement;
   doc.classList.add('js');
@@ -343,7 +365,7 @@ ${group('jd', '京东')}
   };
   const cell = v => String(v == null ? '' : v).replace(/[\\t\\n]/g, ' ');
   const table = list => [['广播日', '平台', '店铺', '类型', '结果', '首次看到在播', '最后看到在播', '本场开始', '8点在播', '当天累计分钟', '当天满播率', '上一日满播率', '要关注', '数据截至'].join('\\t')]
-    .concat(list.map(x => [x.date, x.p, x.name, x.role, x.status, x.seenFrom, x.seenTo, x.start, x.live8, x.minutes, x.dayRate, x.prevRate, x.note, data.asOfIso].map(cell).join('\\t'))).join('\\n');
+    .concat(list.map(x => [x.date, x.p, x.name, x.role, x.status, x.seenFrom, x.seenTo, x.start, x.live8, x.minutes, x.dayRate, x.prevRate, x.note, x.asOfIso].map(cell).join('\\t'))).join('\\n');
   const copy = (t, n, what) => {
     const done = () => { msg.textContent = '已复制 ' + n + ' 条' + what; fb.hidden = true; };
     const fail = () => { fb.value = t; fb.hidden = false; fb.focus(); fb.select(); try { fb.setSelectionRange(0, t.length); } catch (e) {} msg.textContent = '这里不能自动复制。下面的文字已全选，长按选择「拷贝」即可。'; };
