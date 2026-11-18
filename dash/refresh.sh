@@ -31,6 +31,17 @@ DY=$(pick 417529171 'R316_RPA {' dy.log) || { echo "NO_DOUYIN_RUN_WITH_DATA"; ex
 TM=$(pick 417885046 'R329_TMALL {' tm.log) || { echo "NO_TMALL_RUN_WITH_DATA"; exit 1; }
 echo "runs: jd=$JD douyin=$DY tmall=$TM"
 
+# Retain latest completed run health even when the usable snapshot is older.
+latest_completed() {
+  gh api "repos/$R/actions/workflows/$1/runs?per_page=1&status=completed&branch=main" \
+    --jq '.workflow_runs[0] | {id,at:(.run_started_at // .created_at),conclusion}' 2>/dev/null ||
+    printf '%s\n' null
+}
+LATEST_JD_RUN=$(latest_completed 417538022)
+LATEST_DY_RUN=$(latest_completed 417529171)
+LATEST_TM_RUN=$(latest_completed 417885046)
+export LATEST_JD_RUN LATEST_DY_RUN LATEST_TM_RUN
+
 # Registry config from main: used by the leak check, and by names.mjs for the store names shown on the universal page.
 mkdir -p "$MAIN_DIR"
 for f in probe-targets.json r316-douyin-rpa-targets.json r326-douyin-targets-scoring-b.json r329-douyin-targets-monitor-c.json r329-douyin-targets-monitor-d.json; do
@@ -47,7 +58,9 @@ console.log(new Date(Date.parse(d+"T06:00:00+08:00")-15*60e3).toISOString().slic
 rm -rf runs && mkdir -p runs
 for pair in dy:417529171 tm:417885046; do
   p=${pair%%:*}; wf=${pair##*:}
-  for id in $(gh api "repos/$R/actions/workflows/$wf/runs?per_page=100&status=success&branch=main&created=>=$SINCE" --jq '.workflow_runs[].id'); do
+  ids=$(gh api "repos/$R/actions/workflows/$wf/runs?per_page=100&status=success&branch=main&created=>=$SINCE" --jq '.workflow_runs[].id') ||
+    { echo "TIMELINE_RUN_LIST_FAILED workflow=$wf" >&2; exit 1; }
+  for id in $ids; do
     gh run view "$id" -R "$R" --log > "runs/$p-$id.log" 2>/dev/null || { echo "LOG_FETCH_FAILED $id"; rm -f "runs/$p-$id.log"; }
   done
 done
