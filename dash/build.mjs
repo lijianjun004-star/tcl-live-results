@@ -1,6 +1,7 @@
 // Builds the four masked dashboard datasets from the public GitHub Actions run logs.
 // Inputs: jd.log (R327_JD_DAY), dy.log (R325_DAILY, R316_RPA), tm.log (R325_DAILY, R329_TMALL). Output: out/*.json
 import fs from 'node:fs';
+import { beijingDay } from './freshness.mjs';
 const M = (process.env.MAIN_DIR || '/tmp/mainsrc') + '/main-';   // config files fetched from main by refresh.sh
 const strip = l => l.replace(/\x1b\[[0-9;]*m/g, '').replace(/^[^\t]*\t[^\t]*\t[^ ]*Z /, '');
 const tsOf = l => (l.match(/\t[﻿]?(\d{4}-\d\d-\d\dT[\d:.]+Z) /) || [])[1] || null;
@@ -21,51 +22,99 @@ const dyLabel = k => { const i = dyKeys.indexOf(k); if (i < 0) throw new Error('
 const tmLabel = k => { const i = tmKeys.indexOf(k); if (i < 0) throw new Error('TM_KEY_UNMAPPED'); return 'T' + (i + 1); };
 const daily = (lines) => Object.values(Object.fromEntries(lines.map(strip).filter(l => l.startsWith('R325_DAILY {')).map(l => JSON.parse(l.slice(11)))
   .filter(d => d && typeof d.key === 'string' && /^\d{4}-\d\d-\d\d$/.test(d.date) && typeof d.samples === 'number').map(d => [d.key + '|' + d.date, d])));
-const stamp = d => d.toISOString();
 const runIds = { jd: process.env.RUN_JD || 43595261311, dy: process.env.RUN_DY || 43593315399, tm: process.env.RUN_TM || 43593317583 };
 const prov = (extra) => [{ label: '来源', value: extra }, { label: '整理', value: '脚本 build.mjs 解析 GitHub Actions 运行日志里的结构化行，账号统一用 #1–#7、T1–T9、jd-编号代替，不含任何真实标识。' }, { label: '性质', value: '快照，不是实时；只读采样，不用于处罚。' }];
+const asIso = value => {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && ms <= Date.now() ? new Date(ms).toISOString() : null;
+};
+const newest = values => values.map(asIso).filter(Boolean).sort().at(-1) || null;
+const ownRoom = new Set(['OWNER_HEADER_LIVE_ANCHOR', 'REGISTERED_ROOM_LIVE_ANCHOR']);
+const dyVerified = r => r.profileIdentityVerified === true && r.state !== 'NOT_RUN' &&
+  ((r.state === 'LIVE' && (r.roomIdentityVerified === true || r.roomPageIdentityVerified === true)) ||
+    r.state === 'OFFLINE' || (r.liveBadgeSeen === true && ownRoom.has(r.ownerAnchorScope)));
+const tmVerified = r => r.identityVerified === true && (r.state === 'LIVE' || r.state === 'OFFLINE');
+const evidenceAt = (day, timestamp) => {
+  const at = asIso(timestamp);
+  return at && beijingDay(Date.parse(at),6) === day ? at : null;
+};
+const runConclusions = new Set(['success', 'failure', 'cancelled', 'timed_out', 'action_required', 'skipped', 'neutral', 'stale', 'startup_failure']);
+function latestRun(name) {
+  try {
+    const r = JSON.parse(process.env[name] || 'null');
+    const at = asIso(r?.at);
+    if (Number.isSafeInteger(r?.id) && r.id > 0 && at && runConclusions.has(r.conclusion)) {
+      return { id: r.id, at, conclusion: r.conclusion };
+    }
+  } catch {}
+  return null;
+}
 
 // ---------- Douyin
 const dyLines = L('dy.log');
 const rpa = dyLines.map(strip).filter(l => l.startsWith('R316_RPA {')).map(l => JSON.parse(l.slice(9)));
-const dyAts = rpa.map(r => r.at).sort();
-const dyRows = daily(dyLines).map(d => ({ account: dyLabel(d.key), role: dyKeys.indexOf(d.key) < 4 ? '考核' : '仅监测', date: d.date, result: RES[d.status], seen: span(d.firstSeenAt, d.lastSeenAt), seenFrom: d.firstSeenAt || null, seenTo: d.lastSeenAt || null, samples: d.verifiedSamples }))
+const dyAts = rpa.filter(r => r.state !== 'NOT_RUN').map(r => asIso(r.at)).filter(Boolean).sort();
+const dyRows = daily(dyLines).map(d => ({
+  account: dyLabel(d.key), role: dyKeys.indexOf(d.key) < 4 ? '考核' : '仅监测', date: d.date, result: RES[d.status], seen: span(d.firstSeenAt, d.lastSeenAt),
+  seenFrom: d.firstSeenAt || null, seenTo: d.lastSeenAt || null, samples: d.verifiedSamples,
+  verifiedAt: d.verifiedSamples > 0 ? d.status === 'BROADCAST_SEEN' ? evidenceAt(d.date,d.lastSeenAt)
+    : newest(rpa.filter(r => r.key === d.key && dyVerified(r)).map(r => evidenceAt(d.date,r.at))) : null
+}))
   .sort((a, b) => b.date.localeCompare(a.date) || num(a.account) - num(b.account));
 const dyStopLine = stopLine(dyLines, 'R316_RPA_STOPPED');
 const dyStopped = !!dyStopLine || rpa.some(r => r.stop);
 const dyPause = pauseOf(dyStopped ? (dyStopLine && tsOf(dyStopLine)) || rpa.find(r => r.stop)?.at || null : null);
 // ---------- Tmall
 const tmLines = L('tm.log');
-const tmRecs = tmLines.map(strip).filter(l => l.startsWith('R329_TMALL {')).map(l => JSON.parse(l.slice(11)));
-const tmTs = tmLines.filter(l => l.includes('R329_TMALL {')).map(tsOf).filter(Boolean).sort();
+const tmRecs = tmLines.flatMap(l => {
+  const record = strip(l);
+  if (!record.startsWith('R329_TMALL {')) return [];
+  const r = JSON.parse(record.slice(11));
+  return r.state === 'NOT_RUN' ? [] : [{ ...r, loggedAt: asIso(tsOf(l)) }];
+});
+const tmTs = tmRecs.map(r => r.loggedAt).filter(Boolean).sort();
 const tmStopLine = stopLine(tmLines, 'R329_TMALL_STOPPED');
 const tmStopped = !!tmStopLine || tmRecs.some(r => String(r.reason || '').startsWith('STOPPED_'));
 const tmPause = pauseOf(tmStopped ? (tmStopLine && tsOf(tmStopLine)) || tmTs.at(-1) || null : null);
 const tmDaily = daily(tmLines);
 const tmLatest = tmDaily.map(d => d.date).sort().pop();
-const nowText = r => !r ? '—' : r.state === 'LIVE' ? '在播' + (r.sourceStartTime ? ' · ' + hhmm(r.sourceStartTime) + ' 开始' : '') : r.state === 'OFFLINE' ? '接口显示未开播' : r.state === 'NOT_RUN' ? '未执行' : '无法判断';
-const tmRows = tmDaily.map(d => ({ shop: tmLabel(d.key), date: d.date, result: RES[d.status], seen: span(d.firstSeenAt, d.lastSeenAt), seenFrom: d.firstSeenAt || null, seenTo: d.lastSeenAt || null, samples: d.verifiedSamples, now: d.date === tmLatest ? nowText(tmRecs.find(r => r.key === d.key)) : '—', nowStart: d.date === tmLatest ? (tmRecs.find(r => r.key === d.key && r.state === 'LIVE')?.sourceStartTime ?? null) : null }))
+const nowText = r => !r ? '—' : !tmVerified(r) ? '无法判断' : r.state === 'LIVE' ? '在播' + (r.sourceStartTime ? ' · ' + hhmm(r.sourceStartTime) + ' 开始' : '') : '接口显示未开播';
+const tmRows = tmDaily.map(d => ({
+  shop: tmLabel(d.key), date: d.date, result: RES[d.status], seen: span(d.firstSeenAt, d.lastSeenAt),
+  seenFrom: d.firstSeenAt || null, seenTo: d.lastSeenAt || null, samples: d.verifiedSamples,
+  verifiedAt: d.verifiedSamples > 0 ? d.status === 'BROADCAST_SEEN' ? evidenceAt(d.date,d.lastSeenAt)
+    : newest(tmRecs.filter(r => r.key === d.key && tmVerified(r)).map(r => evidenceAt(d.date,r.loggedAt))) : null,
+  now: d.date === tmLatest ? nowText(tmRecs.find(r => r.key === d.key)) : '—',
+  nowStart: d.date === tmLatest ? (tmRecs.find(r => r.key === d.key && r.state === 'LIVE' && tmVerified(r))?.sourceStartTime ?? null) : null
+}))
   .sort((a, b) => b.date.localeCompare(a.date) || num(a.shop) - num(b.shop));
 // ---------- JD
 const jdLines = L('jd.log');
 const jd = jdLines.map(strip).filter(l => l.startsWith('R327_JD_DAY ')).map(l => JSON.parse(l.slice(12)));
-const jdAt = jdLines.filter(l => l.includes('R327_JD_FULLDAY ')).map(tsOf).filter(Boolean).pop();
-const jdFull = JSON.parse(strip(jdLines.find(l => l.includes('R327_JD_FULLDAY '))).slice(16));
-// JD follows the broadcast day the Douyin/Tmall results show, so one page never mixes two days
-// (a JD run after midnight, or the 08:02 snapshot before the first Douyin/Tmall sample of the day).
-const pageDay = [...dyRows.map(r => r.date), ...tmRows.map(r => r.date)].sort().at(-1);
-const dates = [...new Set(jd.map(r => r.date))].sort(), today = dates.includes(pageDay) ? pageDay : dates.at(-1);
-if (!today) throw new Error('JD_DAILY_DATA_MISSING');
+const jdFullLine = jdLines.filter(l => strip(l).startsWith('R327_JD_FULLDAY {')).at(-1);
+if (!jdFullLine) throw new Error('JD_RUN_SUMMARY_MISSING');
+const jdFull = JSON.parse(strip(jdFullLine).slice(16));
+const jdAt = asIso(jdFull.attemptedAt) || asIso(tsOf(jdFullLine));
+// Older success logs used only a read timestamp; newer logs provide observation time.
+const jdVerifiedAt = Object.hasOwn(jdFull,'sourceStatus') ? asIso(jdFull.lastSuccessfulSourceAt)
+  : jdFull.dailyOk > 0 ? jdAt : null;
+// JD uses a calendar day, while Douyin/Tmall change broadcast day at 06:00.
+const today = beijingDay(Date.now());
 // Do not relabel an older record as the previous calendar day.
 const prevDate = new Date(Date.parse(today + 'T00:00:00Z') - 864e5).toISOString().slice(0, 10);
 const pct = a => a[0] === a[1] ? a[0] + '%' : a[0] + '%–' + a[1] + '%';
 const ids = [...new Set(jd.map(r => r.roomId))].sort((a, b) => a - b);
 const jdRows = ids.map(id => {
   const t = jd.find(r => r.roomId === id && r.date === today), p = jd.find(r => r.roomId === id && r.date === prevDate);
+  const h = jd.filter(r => r.roomId === id && r.date < today).sort((a,b) => b.date.localeCompare(a.date))[0];
   const snap = p?.method === 'FROM_0800_SNAPSHOT' && Number.isFinite(p.ratePercent);
   const range = Array.isArray(p?.routineAssumedRangePercent) && p.routineAssumedRangePercent.length === 2 && p.routineAssumedRangePercent.every(Number.isFinite);
   return { room: 'jd-' + id, category: t?.category ?? p?.category ?? jd.find(r => r.roomId === id)?.category ?? '—', todayDate: today,
     todayMissing: !t, previousMissing: !p,
+    verifiedAt: t && (Number.isFinite(t.soFarMinutes) || Number.isFinite(t.totalDayMinutes))
+      ? (Object.hasOwn(t,'observedAt') ? asIso(t.observedAt) : jdVerifiedAt) : null,
+    historyDate: h?.date ?? null, historyMinutes: h?.totalDayMinutes ?? h?.soFarMinutes ?? null,
     live8: t?.liveByWindowStart === true ? '是' : t?.liveByWindowStart === false ? '否' : '—',
     minutesToday: t?.soFarMinutes ?? t?.totalDayMinutes ?? null,
     dayRate: t?.method === 'FROM_0800_SNAPSHOT' && Number.isFinite(t.ratePercent) ? t.ratePercent + '%' : '',
@@ -77,9 +126,16 @@ const jdRows = ids.map(id => {
 // ---------- runs
 // Douyin 'verified' uses the daily-ledger rule (profile identity checked); the room itself can only be checked while it is live.
 const runsRows = [
-  { platform: '京东', asOf: hhmm(jdAt), atFrom: jdAt || null, atTo: jdAt || null, checked: jdFull.rooms, reachable: jdFull.dailyOk, verified: '—', note: '运营平台只读，读每日分钟数' },
-  { platform: '抖音', asOf: span(dyAts[0], dyAts.at(-1)), atFrom: dyAts[0] || null, atTo: dyAts.at(-1) || null, checked: rpa.length, reachable: rpa.filter(r => r.profileHttp === 200).length, verified: rpa.filter(r => r.state !== 'NOT_RUN' && r.profileIdentityVerified).length, pause: dyPause, note: dyStopped ? '平台要求验证，按规则暂停 24 小时' : '没有被拦，没有进入冷却' },
-  { platform: '天猫淘宝', asOf: span(tmTs[0], tmTs.at(-1)), atFrom: tmTs[0] || null, atTo: tmTs.at(-1) || null, checked: tmRecs.length, reachable: tmRecs.filter(r => r.http === 200).length, verified: tmRecs.filter(r => r.identityVerified).length, pause: tmPause, note: tmStopped ? '平台要求验证，按规则暂停 24 小时' : '没有被拦，没有进入冷却' },
+  { platform: '京东', asOf: hhmm(jdAt), atFrom: jdAt, atTo: jdAt, verifiedAt: jdVerifiedAt,
+    latestRun: latestRun('LATEST_JD_RUN'), checked: jdFull.rooms, reachable: jdFull.dailyOk, verified: '—', note: '运营平台只读，读每日分钟数' },
+  { platform: '抖音', asOf: span(dyAts[0], dyAts.at(-1)), atFrom: dyAts[0] || null, atTo: dyAts.at(-1) || null,
+    verifiedAt: newest([...dyRows.map(r => r.verifiedAt), ...rpa.filter(dyVerified).map(r => r.at)]),
+    latestRun: latestRun('LATEST_DY_RUN'), checked: rpa.filter(r => r.state !== 'NOT_RUN').length,
+    reachable: rpa.filter(r => r.state !== 'NOT_RUN' && r.profileHttp === 200).length, verified: rpa.filter(dyVerified).length, pause: dyPause },
+  { platform: '天猫淘宝', asOf: span(tmTs[0], tmTs.at(-1)), atFrom: tmTs[0] || null, atTo: tmTs.at(-1) || null,
+    verifiedAt: newest([...tmRows.map(r => r.verifiedAt), ...tmRecs.filter(tmVerified).map(r => r.loggedAt)]),
+    latestRun: latestRun('LATEST_TM_RUN'), checked: tmRecs.length, reachable: tmRecs.filter(r => r.http === 200).length,
+    verified: tmRecs.filter(tmVerified).length, pause: tmPause },
 ];
 if (!jdRows.length || !dyRows.length || !tmRows.length || !rpa.length || !tmRecs.length) throw new Error('EMPTY_DATASET jd=' + jdRows.length + ' dy=' + dyRows.length + ' tm=' + tmRows.length + ' rpa=' + rpa.length + ' tmRecs=' + tmRecs.length);
 fs.mkdirSync('out', { recursive: true });
