@@ -33,9 +33,21 @@ function readPrivateValues(value, key = '') {
 }
 const privateDir = process.env.V2_PRIVATE_DIR;
 if (privateDir) {
-  for (const name of ['monitor_snapshot','resolved_rooms','control_live_result','run_summary','drive_status']) {
-    const file = path.join(privateDir, name + '.json');
-    if (fs.existsSync(file)) readPrivateValues(JSON.parse(fs.readFileSync(file, 'utf8')));
+  const directories = [privateDir];
+  const historyFile = path.join(privateDir, 'history.json');
+  if (fs.existsSync(historyFile)) {
+    const history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+    if (!Array.isArray(history.entries) || history.entries.length > 12 ||
+        !history.entries.every(p => typeof p === 'string' && /^history\/[1-9]\d{0,19}-[1-9]\d{0,5}$/.test(p))) {
+      throw new Error('V2_PRIVATE_HISTORY');
+    }
+    directories.push(...history.entries.map(p => path.join(privateDir, p)));
+  }
+  for (const directory of directories) {
+    for (const name of ['monitor_snapshot','resolved_rooms','control_live_result','run_summary','drive_status']) {
+      const file = path.join(directory, name + '.json');
+      if (fs.existsSync(file)) readPrivateValues(JSON.parse(fs.readFileSync(file, 'utf8')));
+    }
   }
 }
 const names = JSON.parse(fs.readFileSync(fileURLToPath(new URL('./private/names.json', import.meta.url)), 'utf8')).names;

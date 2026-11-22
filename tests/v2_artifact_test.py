@@ -1,6 +1,7 @@
 """Offline acquisition checks. All archived records and API responses are synthetic."""
 from collections import Counter
 from copy import deepcopy
+from datetime import timedelta
 from functools import cache
 import hashlib
 import importlib.util
@@ -55,7 +56,7 @@ def fixture():
     return json.loads(subprocess.check_output(cmd, cwd=ROOT))
 
 
-def create_archive(directory, run, summary_changes=None, corrupt_member=False, room_count=10):
+def create_archive(directory, run, summary_changes=None, corrupt_member=False, room_count=10, transform=None):
     run_id = str(run["id"])
     attempt = run["run_attempt"]
     evidence = deepcopy(fixture()["evidence"])
@@ -65,12 +66,17 @@ def create_archive(directory, run, summary_changes=None, corrupt_member=False, r
     for key in ("snapshot", "resolved"):
         evidence[key]["run_id"] = f"{run_id}.{attempt}"
         evidence[key]["rooms"] = evidence[key]["rooms"][:room_count]
+    if transform is not None:
+        evidence = transform(evidence)
+        summary = evidence["summary"]
     # Counts describe the shortened round itself; stale totals cannot cause its rejection.
     rows = evidence["snapshot"]["rooms"]
     codes = dict(Counter(row["code"] for row in rows))
     platforms = dict(Counter(row["platform"] for row in rows))
     summary.update(targets_total=room_count, by_code=codes, by_platform=platforms)
-    evidence["snapshot"]["summary"].update(total=room_count, abnormal=room_count,
+    evidence["snapshot"]["summary"].update(total=room_count, live=codes.get("OK", 0),
+                                           offline=codes.get("OFFLINE", 0),
+                                           abnormal=room_count - codes.get("OK", 0) - codes.get("OFFLINE", 0),
                                            by_code=codes, by_platform=platforms)
     summary.update(summary_changes or {})
     members = {
@@ -212,14 +218,18 @@ class AcquisitionTests(unittest.TestCase):
         self.downloads = {}
         self.requests = Counter()
 
-    def provide(self, run, *, job_result="success", expired=False, room_count=10):
+    def provide(self, run, *, job_result="success", expired=False, room_count=10,
+                transform=None, summary_changes=None, corrupt_member=False, completed_at=None):
         rid, attempt = run["id"], run["run_attempt"]
         job = {**live_job(run), "conclusion": job_result}
+        if completed_at is not None:
+            job["completed_at"] = completed_at
         self.responses[f"runs/{rid}/attempts/{attempt}"] = run
         self.responses[f"runs/{rid}/attempts/{attempt}/jobs?per_page=100"] = {"jobs": [job]}
         if job_result != "success":
             return None
-        archive, artifact = create_archive(self.directory, run, room_count=room_count)
+        archive, artifact = create_archive(self.directory, run, room_count=room_count, transform=transform,
+                                           summary_changes=summary_changes, corrupt_member=corrupt_member)
         artifact["expired"] = expired
         self.responses[f"runs/{rid}/artifacts?name={artifact['name']}&per_page=100"] = {
             "artifacts": [artifact]
@@ -228,9 +238,11 @@ class AcquisitionTests(unittest.TestCase):
         self.downloads[download] = archive.read_bytes()
         return download
 
-    def acquire(self, listed):
+    def acquire(self, listed, total_count=None):
         listing = "workflows/v2-monitor.yml/runs?branch=main&status=completed&per_page=100"
         self.responses[listing] = {"workflow_runs": listed}
+        if total_count is not None:
+            self.responses[listing]["total_count"] = total_count
 
         def github(path, output=None):
             self.requests[path] += 1
@@ -317,4 +329,194 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual((latest["runId"], latest["attempt"]), (str(expired["id"]), 1))
         self.assertIsNone(selected)
         self.assertEqual(self.requests[download], 0)
-        self.assertEqual(sorted(path.name for path in self.output.iterdir()), ["latest.json"])
+        self.assertEqual(sorted(path.name for path in self.output.iterdir()), ["history.json", "latest.json"])
+
+    def history_record(self, number, seconds_ago=0, attempt=1):
+        end = fetch.utc(AT) - timedelta(seconds=seconds_ago)
+        stamp = lambda dt: dt.isoformat().replace("+00:00", "Z")
+        return {**run_record(attempt), "id": RUN_ID + number,
+                "created_at": stamp(end - timedelta(seconds=30)),
+                "run_started_at": stamp(end - timedelta(seconds=29)), "updated_at": stamp(end)}
+
+    def provide_history(self, run, outcome=None, **kwargs):
+        delta = fetch.utc(run["updated_at"]) - fetch.utc(AT)
+
+        def transform(evidence):
+            def shift(value):
+                if isinstance(value, dict):
+                    return {key: shift(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [shift(item) for item in value]
+                if isinstance(value, str) and value.startswith("2026-11-16T"):
+                    return (fetch.utc(value) + delta).isoformat().replace("+00:00", "Z")
+                return value
+            evidence = shift(evidence)
+            if outcome:
+                row = evidence["snapshot"]["rooms"][0]
+                row.update(code=outcome, live_status="live" if outcome == "OK" else "offline",
+                           live_id="80000000001" if outcome == "OK" else None,
+                           reason=None, diagnostics={"identity_verified": True, "network": {"allowed": 1},
+                           "passive_observation": {"navigation_attempted": True},
+                           "offline_evidence": outcome == "OFFLINE", "offline_rule_validated": outcome == "OFFLINE"})
+            return evidence
+        return self.provide(run, transform=transform, completed_at=run["updated_at"], **kwargs)
+
+    def history_manifest(self):
+        return json.loads((self.output / "history.json").read_text())
+
+    def test_history_keeps_all_rounds_including_intervening_offline_and_original_current_bytes(self):
+        older, offline, newer, current = [self.history_record(n, (3 - n) * 1800) for n in range(4)]
+        self.provide_history(older, "OK")
+        self.provide_history(offline, "OFFLINE")
+        self.provide_history(newer, "OK")
+        self.provide_history(current)
+        _, selected = self.acquire([current, newer, offline, older])
+        self.assertEqual(selected["runId"], str(current["id"]))
+        manifest = self.history_manifest()
+        self.assertEqual(manifest, {"status": "complete", "entries": [
+            f"history/{run['id']}-1" for run in (newer, offline, older)]})
+        offline_snapshot = json.loads((self.output / manifest["entries"][1] / "monitor_snapshot.json").read_text())
+        self.assertEqual(offline_snapshot["rooms"][0]["code"], "OFFLINE")
+        with ZipFile(self.directory / f"evidence-{current['id']}-1.zip") as archive:
+            for name in fetch.INPUTS:
+                self.assertEqual((self.output / name).read_bytes(), archive.read(name))
+
+    def test_history_excludes_old_runs_without_requesting_their_jobs_or_archives(self):
+        current = self.history_record(2)
+        old = self.history_record(0, 10802)
+        boundary = self.history_record(1, 10799)
+        self.provide_history(current)
+        self.provide_history(boundary, "OK")
+        old_download = self.provide_history(old, "OK")
+        self.acquire([current, boundary, old])
+        self.assertEqual(self.history_manifest(), {"status": "complete", "entries": [f"history/{boundary['id']}-1"]})
+        self.assertEqual(self.requests[old_download], 0)
+        self.assertEqual(self.requests[f"runs/{old['id']}/attempts/1/jobs?per_page=100"], 0)
+
+    def test_history_unavailable_when_more_than_twelve_rounds_are_in_window(self):
+        rounds = [self.history_record(n, (13 - n) * 180) for n in range(14)]
+        current_download = self.provide_history(rounds[-1])
+        _, selected = self.acquire(list(reversed(rounds)))
+        self.assertEqual(selected["runId"], str(rounds[-1]["id"]))
+        self.assertEqual(self.requests[current_download], 1)
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+        self.assertFalse((self.output / "history").exists())
+
+    def test_history_accepts_exactly_twelve_prior_rounds_without_truncating(self):
+        rounds = [self.history_record(n, (12 - n) * 180) for n in range(13)]
+        for run in rounds:
+            self.provide_history(run, "OK" if run != rounds[-1] else None)
+        self.acquire(list(reversed(rounds)))
+        self.assertEqual(self.history_manifest(), {"status": "complete", "entries": [
+            f"history/{run['id']}-1" for run in reversed(rounds[:-1])]})
+
+    def test_login_and_timeout_do_not_request_extra_history(self):
+        for code in ("LOGIN_REQUIRED", "NAV_TIMEOUT"):
+            with self.subTest(code=code):
+                current, prior = self.history_record(1), self.history_record(0, 1800)
+
+                def transform(evidence):
+                    for room in evidence["snapshot"]["rooms"]:
+                        if room["platform"] == "tmall":
+                            room["code"] = code
+                    return evidence
+
+                self.provide(current, transform=transform)
+                self.acquire([current, prior])
+                self.assertEqual(self.history_manifest(), {"status": "complete", "entries": []})
+                self.assertEqual(self.requests[f"runs/{prior['id']}/attempts/1/jobs?per_page=100"], 0)
+
+    def test_missing_expired_corrupt_and_contract_rejected_middle_round_discard_all_history(self):
+        for failure in ("missing", "expired", "corrupt", "contract", "parent"):
+            with self.subTest(failure=failure):
+                older, middle, newer, current = [self.history_record(n, (3 - n) * 1800) for n in range(4)]
+                self.provide_history(current)
+                self.provide_history(newer, "OK")
+                older_download = self.provide_history(older, "OK")
+                self.provide_history(middle, "OFFLINE", expired=failure == "expired",
+                                     corrupt_member=failure == "corrupt", room_count=6 if failure == "contract" else 10)
+                path = f"runs/{middle['id']}/artifacts?name=TCL_V2_Evidence_{middle['id']}_a1&per_page=100"
+                if failure == "missing":
+                    self.responses[path] = None
+                if failure == "parent":
+                    self.responses[path]["artifacts"][0]["workflow_run"]["head_sha"] = "b" * 40
+                _, selected = self.acquire([current, newer, middle, older])
+                self.assertEqual(selected["runId"], str(current["id"]))
+                self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+                self.assertFalse((self.output / "history").exists())
+                self.assertEqual(self.requests[older_download], 0)
+
+    def test_history_unavailable_after_pagination_failure_without_harming_current(self):
+        current = self.history_record(1)
+        self.provide_history(current)
+        second_page = "workflows/v2-monitor.yml/runs?branch=main&status=completed&per_page=100&page=2"
+        self.responses[second_page] = None
+        _, selected = self.acquire([current] * 100)
+        self.assertEqual(selected["runId"], str(current["id"]))
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+
+    def test_history_unavailable_when_total_count_discloses_missing_source_rows(self):
+        current = self.history_record(1)
+        self.provide_history(current)
+        self.acquire([current], total_count=2)
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+
+    def test_duplicate_listing_records_cannot_claim_complete_history(self):
+        current = self.history_record(1)
+        self.provide_history(current)
+        _, selected = self.acquire([current, current], total_count=2)
+        self.assertEqual(selected["runId"], str(current["id"]))
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+
+    def test_history_rejects_hidden_retry_attempts_even_when_latest_attempt_failed(self):
+        for conclusion in ("success", "failure"):
+            with self.subTest(conclusion=conclusion):
+                current = self.history_record(1)
+                prior = {**self.history_record(0, 1800, attempt=2), "conclusion": conclusion}
+                self.provide_history(current)
+                self.acquire([current, prior])
+                self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+                self.assertEqual(self.requests[f"runs/{prior['id']}/attempts/1"], 0)
+
+    def test_history_rejects_unparseable_and_reversed_run_times(self):
+        for index, changes in enumerate(({"updated_at": "invalid"}, {"run_started_at": "2026-11-16T12:59:00Z"})):
+            with self.subTest(changes=changes):
+                current = self.history_record(1)
+                prior = {**self.history_record(0, 1800), **changes}
+                self.provide_history(current)
+                # Invalid updated_at would change the old selector's lexical order;
+                # place it before the valid candidate so this tests history alone.
+                listing = fetch.RunListing([current, prior])
+                listing.complete = True
+                selected_dir = self.directory / f"direct-{index}"
+                selected_dir.mkdir()
+                archive, artifact = create_archive(self.directory, current)
+                fetch.verify_archive(archive, artifact, current, selected_dir)
+                latest = {"runId": str(current["id"]), "attempt": 1, "conclusion": "success"}
+                outcome = fetch.acquire_history(selected_dir, current, live_job(current), listing, latest)
+                self.assertEqual(outcome, {"status": "unavailable", "entries": []})
+
+    def test_history_rejects_archive_time_later_than_attested_job(self):
+        current, prior = self.history_record(1), self.history_record(0, 1800)
+        self.provide_history(current)
+        self.provide_history(prior, "OK", summary_changes={"completed_utc": current["updated_at"]})
+        _, selected = self.acquire([current, prior])
+        self.assertEqual(selected["runId"], str(current["id"]))
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+
+    def test_history_budget_exhaustion_preserves_already_selected_current_snapshot(self):
+        current, prior = self.history_record(1), self.history_record(0, 1800)
+        self.provide_history(current)
+        with patch.object(fetch, "lookup_deadline", 1), patch.object(fetch.time, "monotonic", side_effect=[0, 2]):
+            _, selected = self.acquire([current, prior])
+        self.assertEqual(selected["runId"], str(current["id"]))
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
+
+    def test_history_no_extra_fetch_when_current_is_an_older_selection_fallback(self):
+        current, prior = self.history_record(1), self.history_record(0, 1800)
+        self.provide_history(current, expired=True)
+        self.provide_history(prior, "OK")
+        latest, selected = self.acquire([current, prior])
+        self.assertEqual(latest["runId"], str(current["id"]))
+        self.assertEqual(selected["runId"], str(prior["id"]))
+        self.assertEqual(self.history_manifest(), {"status": "unavailable", "entries": []})
