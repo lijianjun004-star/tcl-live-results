@@ -74,10 +74,10 @@ def verify_run(run):
     require(all(isinstance(run.get(key), dict) and run[key].get("full_name") == REPO
                 for key in ("repository", "head_repository")), "run_repository")
     require(run.get("head_branch") == "main" and run.get("path") == WORKFLOW
-            and run.get("event") == "workflow_dispatch" and run.get("status") == "completed"
+            and run.get("event") in ("workflow_dispatch", "schedule") and run.get("status") == "completed"
             and re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha", ""))), "run_identity")
     if run["id"] == BASE:
-        require(run["head_sha"] == BASE_SHA, "baseline_identity")
+        require(run["head_sha"] == BASE_SHA and run["event"] == "workflow_dispatch", "baseline_identity")
 
 
 def live_job(run, jobs):
@@ -179,7 +179,7 @@ def verify_archive(path, artifact, run, destination):
         raise Rejected("invalid_archive") from None
     for name, data in members.items():
         (destination / name).write_bytes(data)
-    source = {"runId": str(run["id"]), "attempt": run["run_attempt"], "headSha": run["head_sha"]}
+    source = {"runId": str(run["id"]), "attempt": run["run_attempt"], "headSha": run["head_sha"], "event": run["event"]}
     (destination / "source.json").write_text(json.dumps(source))
 
 
@@ -205,7 +205,7 @@ def fetch_candidate(run, directory):
 
 
 def runs_to_check():
-    path = "workflows/v2-monitor.yml/runs?branch=main&event=workflow_dispatch&status=completed&per_page=100"
+    path = "workflows/v2-monitor.yml/runs?branch=main&status=completed&per_page=100"
     result = []
     # GitHub's filtered workflow-runs endpoint returns up to 1,000 results.
     for page in range(1, 11):
@@ -278,7 +278,7 @@ def acquire(output):
                 previous = api(f"runs/{run['id']}/attempts/{run['run_attempt'] - 1}")
                 verify_run(previous)
                 require(previous["id"] == run["id"] and previous["run_attempt"] == run["run_attempt"] - 1
-                        and previous["head_sha"] == run["head_sha"], "previous_attempt")
+                        and previous["head_sha"] == run["head_sha"] and previous["event"] == run["event"], "previous_attempt")
                 runs.append(previous)
             except Rejected:
                 pass

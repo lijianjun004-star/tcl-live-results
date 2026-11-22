@@ -145,8 +145,11 @@ function selectSource(snapshot, resolved, summary, control, drive, provenance) {
   const attempt = Number(provenance?.attempt);
   insist(/^[1-9]\d{0,19}$/.test(runId) && Number.isSafeInteger(attempt) && attempt > 0 &&
     String(attempt) === String(provenance.attempt) && pattern(/^[a-f0-9]{40}$/)(provenance.headSha), 'PROVENANCE');
+  // Older private source files were written when only manual runs were eligible.
+  const event = Object.hasOwn(provenance, 'event') ? provenance.event : 'workflow_dispatch';
   insist(record(summary) && summary.repository === 'lijianjun004-star/tcl-live-monitor' && summary.branch === 'main' &&
-    summary.event === 'workflow_dispatch' && summary.engine === 'live' && summary.head_sha === provenance.headSha &&
+    ['workflow_dispatch', 'schedule'].includes(event) && summary.event === event &&
+    summary.engine === 'live' && summary.head_sha === provenance.headSha &&
     summary.schema_version === '2.0' && summary.run_id === runId && summary.run_attempt === String(attempt) &&
     snapshot.run_id === runId + '.' + attempt && resolved.run_id === snapshot.run_id &&
     summary.contract_validation?.monitor_snapshot === 'ok' && summary.contract_validation?.resolved_rooms === 'ok' &&

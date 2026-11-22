@@ -60,7 +60,8 @@ def create_archive(directory, run, summary_changes=None, corrupt_member=False, r
     attempt = run["run_attempt"]
     evidence = deepcopy(fixture()["evidence"])
     summary = evidence["summary"]
-    summary.update({"run_id": run_id, "run_attempt": str(attempt), "head_sha": run["head_sha"]})
+    summary.update({"run_id": run_id, "run_attempt": str(attempt), "head_sha": run["head_sha"],
+                    "event": run["event"]})
     for key in ("snapshot", "resolved"):
         evidence[key]["run_id"] = f"{run_id}.{attempt}"
         evidence[key]["rooms"] = evidence[key]["rooms"][:room_count]
@@ -130,7 +131,7 @@ class ArtifactTests(unittest.TestCase):
 
     def test_valid_archive_hash_cannot_substitute_for_attested_run(self):
         changes = [
-            {"repository": "fixture/fork"}, {"branch": "other"}, {"event": "push"},
+            {"repository": "fixture/fork"}, {"branch": "other"}, {"event": "push"}, {"event": "schedule"},
             {"run_id": "1234"}, {"run_attempt": "2"}, {"head_sha": "b" * 40},
             {"engine": "fake"},
         ]
@@ -172,6 +173,7 @@ class ArtifactTests(unittest.TestCase):
             ({**registered, "id": registered["id"] + 1}, run),
             ({**registered, "digest": "sha256:" + "f" * 64}, run),
             (registered, {**run, "head_sha": "b" * 40}),
+            (registered, {**run, "event": "schedule"}),
             ({**registered, "name": f"TCL_V2_Evidence_{fetch.BASE}_a2"}, {**run, "run_attempt": 2}),
         ):
             with self.subTest(identity=identity), self.assertRaises(ValueError):
@@ -227,7 +229,7 @@ class AcquisitionTests(unittest.TestCase):
         return download
 
     def acquire(self, listed):
-        listing = "workflows/v2-monitor.yml/runs?branch=main&event=workflow_dispatch&status=completed&per_page=100"
+        listing = "workflows/v2-monitor.yml/runs?branch=main&status=completed&per_page=100"
         self.responses[listing] = {"workflow_runs": listed}
 
         def github(path, output=None):
@@ -246,6 +248,29 @@ class AcquisitionTests(unittest.TestCase):
         latest = json.loads((self.output / "latest.json").read_text())
         source = self.output / "source.json"
         return latest, json.loads(source.read_text()) if source.exists() else None
+
+    def test_selects_newest_eligible_run_across_manual_and_scheduled_events(self):
+        manual = run_record()
+        scheduled = {**manual, "id": RUN_ID + 1, "event": "schedule", "updated_at": "2026-11-16T12:05:00Z"}
+        later_manual = {**manual, "id": RUN_ID + 2, "updated_at": "2026-11-16T12:10:00Z"}
+        push = {**manual, "id": RUN_ID + 3, "event": "push", "updated_at": "2026-11-16T12:15:00Z"}
+        for run in (manual, scheduled, later_manual):
+            self.provide(run)
+        cases = (([manual, push, scheduled], scheduled), ([later_manual, push, scheduled], later_manual))
+        for listed, expected in cases:
+            with self.subTest(event=expected["event"]):
+                latest, selected = self.acquire(listed)
+                self.assertEqual(latest["runId"], str(expected["id"]))
+                self.assertEqual((selected["runId"], selected["event"]), (str(expected["id"]), expected["event"]))
+
+    def test_previous_attempt_of_the_same_run_must_have_the_same_event(self):
+        failed = {**run_record(2), "event": "schedule", "conclusion": "failure"}
+        self.provide(failed, job_result="failure")
+        download = self.provide(run_record(1))  # same run ID and commit, different event
+        latest, selected = self.acquire([failed])
+        self.assertIsNone(selected)
+        self.assertEqual((latest["runId"], latest["attempt"]), (str(RUN_ID), 2))
+        self.assertEqual(self.requests[download], 0)
 
     def test_failed_rerun_keeps_earlier_observations_and_latest_failed_health(self):
         current = {**run_record(2), "conclusion": "failure"}
