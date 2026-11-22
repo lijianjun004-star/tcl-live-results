@@ -301,6 +301,12 @@ h1{margin:6px 0 0;font-size:clamp(24px,6.4vw,34px);line-height:1.25;font-weight:
 .v2-line{grid-column:1/-1;display:block;margin-top:7px;font-size:14px}
 .v2-line b{color:var(--sea);margin-right:4px}
 .v2-line small{display:block;color:var(--mut);font-size:13px}
+.v2-recent{grid-column:1/-1;display:block;padding:8px 10px;margin-top:6px;border-left:3px solid #a76c16;background:#fff4df;color:#69450e;font-size:13px;line-height:1.6;border-radius:4px;overflow-wrap:anywhere}
+.v2-recent[hidden]{display:none}
+[data-v2-recent="EXPIRED"] .v2-recent{border-color:var(--line);background:var(--wash);color:var(--mut)}
+.v2-recent-total{margin:10px 0 4px;padding:10px 12px;border:1px solid #dfc38e;border-radius:8px;background:#fff8eb;color:#69450e;font-size:14px}
+.v2-recent-total small{display:block;margin-top:3px;font-size:13px}
+.v2-reference-detail{overflow-wrap:anywhere}
 .v2-detail{margin:0 0 12px;padding:2px 12px 8px;background:var(--plate);border-radius:8px}
 .v2-timeline{margin:8px 0;padding-left:20px;list-style:disc;font-size:14px}
 .v2-timeline li::marker{color:var(--sea)}
@@ -345,14 +351,14 @@ ${[['douyin', '抖音'], ['tmall', '天猫淘宝'], ['jd', '京东']].map(([p, p
 <p class="key"><span>${K('seen')}快照内已确认开播</span><span>${K('unseen')}快照内采样中未见</span><span>${K('unknown')}无法判断或过期</span><span><i class="dot" aria-hidden="true"></i>要关注&nbsp;<b data-attention-total>${attnAll}</b></span></p>
 </div>
 </header>
-${v2Overview(V.source, V.latest, V.counts, v2Counts(v2, genMs))}
+${v2Overview(V.source, V.latest, V.counts, v2Counts(v2, genMs), V.historyStatus)}
 <div class="tools">
 <div class="find" role="search">
 <input id="q" type="search" placeholder="搜索店铺名称，比如 空调、雷鸟" autocomplete="off" enterkeyhint="search" aria-label="搜索店铺名称">
 <div class="seg" role="group" aria-label="按平台筛选">${[['all','全部'],['douyin','抖音'],['tmall','天猫淘宝'],['jd','京东']].map(([p, name]) => `<button type="button" data-pf="${p}" aria-pressed="${p === 'all'}">${name}<span>${shopCount(p === 'all' ? null : p)}</span></button>`).join('')}</div>
 </div>
 <div class="acts">${v2.length ? `<label class="v2-filter">V2 状态<select id="v2-filter">
-<option value="all">全部店卡</option><option value="covered">本轮全部店铺</option><option value="live">当前有在播实证</option><option value="offline">当前有未播实证</option><option value="replay">当前有回放实证</option><option value="unknown">当前未知</option><option value="skipped">本轮跳过</option><option value="uncalibrated">本轮规则待校准</option><option value="historical">历史记录</option></select></label>` : ''}<button type="button" id="attn" aria-pressed="false">台账需关注<span data-attention-total>${attnAll}</span></button><button type="button" id="cp">复制记录</button><button type="button" id="cpx">复制表格</button></div>
+<option value="all">全部店卡</option><option value="covered">本轮全部店铺</option><option value="live">当前有在播实证</option><option value="recent">近期在播参考 · 待复核</option><option value="offline">当前有未播实证</option><option value="replay">当前有回放实证</option><option value="unknown">当前未知</option><option value="skipped">本轮跳过</option><option value="uncalibrated">本轮规则待校准</option><option value="historical">历史记录</option></select></label>` : ''}<button type="button" id="attn" aria-pressed="false">台账需关注<span data-attention-total>${attnAll}</span></button><button type="button" id="cp">复制记录</button><button type="button" id="cpx">复制表格</button></div>
 <p class="msg" id="msg" aria-live="polite"></p>
 <textarea id="fb" readonly hidden aria-label="要复制的记录"></textarea>
 <p class="empty" id="empty" hidden>没有符合条件的直播间。<button type="button" id="clr">清空搜索和筛选</button></p>
@@ -392,25 +398,35 @@ let refreshActiveFilter = () => {};
 const exportRecords = document.getElementById('rec');
 const records = exportRecords ? JSON.parse(exportRecords.textContent) : { rows: [] };
 const sampledCards = records.rows.filter(r => r.v2);
+let referenceExpiryTimer;
 function updateV2Summary(now) {
   if (!sampledCards.length) return;
   let changed = false;
   const labels = new Map(Array.from(document.querySelectorAll('[data-v2-label]'), n => [n.getAttribute('data-v2-label'), n]));
+  const references = new Map(Array.from(document.querySelectorAll('[data-v2-reference]'), n => [n.getAttribute('data-v2-reference'), n]));
   for (const item of sampledCards) {
     const state = v2State(item.v2, now);
     const label = labels.get(item.v2.id);
     if (label) label.textContent = state.label;
+    const reference = references.get(item.v2.id);
+    if (reference) { reference.textContent = state.recentLabel; reference.hidden = state.recentState === 'NONE'; }
     const card = document.getElementById(item.id);
     if (!card) continue;
-    if (card.getAttribute('data-v2-age') !== state.age || card.getAttribute('data-v2-result') !== state.current) {
+    if (card.getAttribute('data-v2-age') !== state.age || card.getAttribute('data-v2-result') !== state.current || card.getAttribute('data-v2-recent') !== state.recentState) {
       card.setAttribute('data-v2-age', state.age);
       card.setAttribute('data-v2-result', state.current);
+      card.setAttribute('data-v2-recent', state.recentState);
       changed = true;
     }
   }
   const totals = v2Counts(sampledCards.map(x => x.v2), now);
   document.querySelectorAll('[data-v2-count]').forEach(n => { n.textContent = String(totals[n.getAttribute('data-v2-count')]); });
   if (changed) refreshActiveFilter();
+  // Expire the reference at the original observation deadline, even if the
+  // page stays open between minute ticks. Resume from background also checks.
+  if (referenceExpiryTimer) clearTimeout(referenceExpiryTimer);
+  const deadlines = sampledCards.map(x => Date.parse(x.v2.recentLive?.observedAt) + 180 * 60000 + 1).filter(t => t > now);
+  if (deadlines.length) referenceExpiryTimer = setTimeout(updateSourceAges, Math.min(2147483647, Math.min(...deadlines) - now));
 }
 function updateCurrentSummary(evidence, now) {
   const counts = {jd:{seen:0,unknown:0},douyin:{seen:0,unknown:0},tmall:{seen:0,unknown:0}};
@@ -485,6 +501,7 @@ document.addEventListener('visibilitychange', updateSourceAges);
     if (!vf || vf.value === 'all') return true;
     if (!r.hasAttribute('data-v2-code')) return false;
     if (vf.value === 'covered') return true;
+    if (vf.value === 'recent') return r.dataset.v2Recent === 'AVAILABLE';
     if (vf.value === 'historical') return r.dataset.v2Age === 'STALE';
     if (vf.value === 'skipped') return r.hasAttribute('data-v2-skip');
     if (vf.value === 'uncalibrated') return r.hasAttribute('data-v2-uncalibrated');
@@ -537,9 +554,9 @@ document.addEventListener('visibilitychange', updateSourceAges);
   };
   const cell = v => String(v == null ? '' : v).replace(/[\\t\\n]/g, ' ');
   const table = list => [['广播日', '平台', '店铺', '类型', '原台账结果', '首次看到在播', '最后看到在播', '本场开始', '8点在播', '当天累计分钟', '当天满播率', '上一日满播率', '台账需关注', '台账数据截至',
-    'V2 编号','V2 范围','V2 本轮记录','V2 时效','V2 当前状态','V2 原因','V2 记录时间','V2 调度登记','V2 采样尝试','V2 有效观测'].join('\\t')]
+    'V2 编号','V2 范围','V2 本轮记录','V2 时效','V2 当前状态','V2 原因','V2 记录时间','V2 调度登记','V2 采样尝试','V2 有效观测','V2 历史参考状态','V2 历史在播确认时间','V2 历史来源批次'].join('\\t')]
     .concat(list.map(x => [x.date, x.p, x.name, x.role, x.status, x.seenFrom, x.seenTo, x.start, x.live8, x.minutes, x.dayRate, x.prevRate, x.note, x.asOfIso,
-      x.v2?.id, x.sample?.role, x.sample?.sample, x.sample?.age, x.sample?.status, x.sample?.reason, x.sample?.recorded, x.sample?.schedule, x.sample?.attempt, x.sample?.verified].map(cell).join('\\t'))).join('\\n');
+      x.v2?.id, x.sample?.role, x.sample?.sample, x.sample?.age, x.sample?.status, x.sample?.reason, x.sample?.recorded, x.sample?.schedule, x.sample?.attempt, x.sample?.verified, x.sample?.recentStatus, x.sample?.recentObserved, x.sample?.recentSource].map(cell).join('\\t'))).join('\\n');
   const copy = (t, n, what) => {
     const done = () => { msg.textContent = '已复制 ' + n + ' 条' + what; fb.hidden = true; };
     const fail = () => { fb.value = t; fb.hidden = false; fb.focus(); fb.select(); try { fb.setSelectionRange(0, t.length); } catch (e) {} msg.textContent = '这里不能自动复制。下面的文字已全选，长按选择「拷贝」即可。'; };

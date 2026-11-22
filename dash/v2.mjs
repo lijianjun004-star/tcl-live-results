@@ -212,7 +212,8 @@ function classify(room, found) {
       room.reason === 'no_live_candidate_in_guest_shop' && found.code === room.code &&
       found.reason === room.reason && found.source === 'none' && shop?.status === 'loaded' &&
       shop.main_http_status === 200 && Array.isArray(found.audit.candidate_ids) && !found.audit.candidate_ids.length;
-    return { status: 'unknown', reason: noCandidate ? 'no_candidate' : publicReason.get(room.code) || 'unrecognized' };
+    const identityMismatch = room.code === 'REDIRECTED' && room.reason === 'identity_mismatch';
+    return { status: 'unknown', reason: noCandidate ? 'no_candidate' : identityMismatch ? 'identity' : publicReason.get(room.code) || 'unrecognized' };
   }
   // A discovered JD room still lacks independently reviewed shop-to-room ownership.
   const d = room.diagnostics;
@@ -269,7 +270,57 @@ export function createV2Projector(registry) {
 
 export const projectV2 = createV2Projector(roster);
 
-export function readV2(dir) {
+// This is a display reference, never a synthetic observation. Both inputs must
+// have passed the same roster/provenance projection; raw fields never cross it.
+// In particular, do not use a previous row's recentLive to create a new one.
+export function attachRecentLive(current, history) {
+  insist(Array.isArray(history) && history.length <= 12, 'HISTORY');
+  const sources = new Set();
+  for (const model of history) {
+    const s = model?.source;
+    insist(record(s) && /^[1-9]\d{0,19}$/.test(s.runId) && Number.isSafeInteger(s.attempt) && s.attempt > 0 &&
+      Array.isArray(model.rows) && model.rows.length === current.rows.length, 'HISTORY');
+    const sourceKey = s.runId + '.' + s.attempt;
+    insist(!sources.has(sourceKey) && sourceKey !== current.source.runId + '.' + current.source.attempt, 'HISTORY');
+    sources.add(sourceKey);
+    insist(new Set(model.rows.map(r => r.id)).size === current.rows.length, 'HISTORY');
+  }
+  const rows = current.rows.map(row => {
+    let recentLive = null;
+    const latestAt = Date.parse(row.recordedAt);
+    if (row.platform !== 'tmall' || row.status !== 'unknown' || !['challenge', 'circuit'].includes(row.reason) ||
+        !Number.isFinite(latestAt)) return { ...row, recentLive };
+    const observations = [];
+    for (const model of history) {
+      const prior = model.rows.find(r => r.id === row.id);
+      insist(prior && prior.platform === row.platform && prior.role === row.role, 'HISTORY');
+      const at = Date.parse(prior.recordedAt);
+      // A malformed intermediate clock can conceal a newer OFFLINE. Do not
+      // reach across this uncertainty to revive an older LIVE observation.
+      if (!Number.isFinite(at)) return { ...row, recentLive };
+      // Overlapping/out-of-order observations cannot promote an older source.
+      if (at >= latestAt) return { ...row, recentLive };
+      if (latestAt - at > 180 * 60000) continue;
+      const definitive = ['live', 'offline', 'replay'].includes(prior.status) && prior.reason === 'confirmed' &&
+        !prior.skipped && prior.verifiedAt === prior.recordedAt && prior.attemptedAt === prior.recordedAt;
+      const conflict = ['identity', 'redirect', 'uncalibrated'].includes(prior.reason);
+      if (definitive || conflict) observations.push({ at, prior, source: model.source, conflict });
+    }
+    observations.sort((a, b) => b.at - a.at || a.source.runId.localeCompare(b.source.runId) || a.source.attempt - b.source.attempt);
+    const last = observations[0];
+    // A trusted OFFLINE/replay/identity conflict is a barrier, including ties.
+    if (last && last.prior.status === 'live' && !last.conflict &&
+        observations.filter(o => o.at === last.at).every(o => o.prior.status === 'live' && !o.conflict)) {
+      recentLive = { observedAt: last.prior.verifiedAt, runId: last.source.runId, attempt: last.source.attempt };
+    }
+    return { ...row, recentLive };
+  });
+  // Counts remain the source's original counts. History has no notification,
+  // duration, scoring or current-state side effects.
+  return { ...current, rows };
+}
+
+function readRound(dir) {
   const read = name => {
     try { return JSON.parse(fs.readFileSync(path.join(dir, name + '.json'), 'utf8')); }
     catch { throw new Error('V2_INPUT'); }
@@ -278,6 +329,26 @@ export function readV2(dir) {
     snapshot: read('monitor_snapshot'), resolved: read('resolved_rooms'), summary: read('run_summary'),
     control: read('control_live_result'), drive: fs.existsSync(path.join(dir, 'drive_status.json')) ? read('drive_status') : null,
   }, read('source'));
+}
+
+export function readV2(dir) {
+  const current = readRound(dir);
+  const file = path.join(dir, 'history.json');
+  if (!fs.existsSync(file)) return current; // Older reader contract remains valid.
+  try {
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+    insist(record(manifest) && ['complete', 'unavailable'].includes(manifest.status) &&
+      Array.isArray(manifest.entries) && manifest.entries.length <= 12 &&
+      new Set(manifest.entries).size === manifest.entries.length &&
+      manifest.entries.every(p => typeof p === 'string' && /^history\/[1-9]\d{0,19}-[1-9]\d{0,5}$/.test(p)), 'HISTORY');
+    if (manifest.status !== 'complete') return { ...current, historyStatus: 'unavailable' };
+    const history = manifest.entries.map(entry => readRound(path.join(dir, entry)));
+    return { ...attachRecentLive(current, history), historyStatus: 'complete' };
+  } catch {
+    // A missing/corrupt historical round may hide an OFFLINE. Do not reach
+    // across that gap for older LIVE; the current round is still usable.
+    return { ...current, historyStatus: 'unavailable' };
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

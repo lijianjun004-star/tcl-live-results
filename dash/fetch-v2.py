@@ -11,7 +11,7 @@ import tempfile
 import time
 import zipfile
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -24,6 +24,9 @@ BASE_DIGEST = "700a5e0d42af34d248a39d58f9f5d9f7f9e47025dbd4308e9228ef2041e39382"
 INPUTS = {"monitor_snapshot.json", "resolved_rooms.json", "run_summary.json", "control_live_result.json"}
 REQUIRED = INPUTS | {"index.html", "SHA256SUMS.txt"}
 MAX_BYTES = 32 * 1024 * 1024
+HISTORY_LIMIT = 12
+HISTORY_WINDOW = timedelta(minutes=180)
+HISTORY_CODES = {"CAPTCHA_X5SEC", "GROUP_CIRCUIT_OPEN"}
 CONCLUSIONS = {"success", "failure", "cancelled", "timed_out", "action_required", "neutral", "stale", "startup_failure"}
 # This optional reader shares a 15-minute publication job with the legacy refresh.
 lookup_deadline = None
@@ -31,6 +34,12 @@ lookup_deadline = None
 
 class Rejected(ValueError):
     """Fixed categories only. Never log third-party names, contents or error messages."""
+
+
+class RunListing(list):
+    """The legacy selector can use partial listings; history must prove coverage."""
+
+    complete = False
 
 
 def require(condition, category):
@@ -184,8 +193,13 @@ def verify_archive(path, artifact, run, destination):
 
 
 def validate_candidate(directory):
-    result = subprocess.run(["node", str(Path(__file__).with_name("v2.mjs")), str(directory)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    timeout = min(35, lookup_deadline - time.monotonic()) if lookup_deadline is not None else 35
+    require(timeout > 0, "lookup_timeout")
+    try:
+        result = subprocess.run(["node", str(Path(__file__).with_name("v2.mjs")), str(directory)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Rejected("lookup_timeout") from None
     require(result.returncode == 0, "data_contract")
 
 
@@ -206,34 +220,150 @@ def fetch_candidate(run, directory):
 
 def runs_to_check():
     path = "workflows/v2-monitor.yml/runs?branch=main&status=completed&per_page=100"
-    result = []
+    result = RunListing()
+    seen_count = 0
+    valid_listing = True
+    expected_total = None
+    listed_identities = set()
     # GitHub's filtered workflow-runs endpoint returns up to 1,000 results.
     for page in range(1, 11):
         try:
-            runs = api(path if page == 1 else f"{path}&page={page}").get("workflow_runs")
+            response = api(path if page == 1 else f"{path}&page={page}")
+            runs = response.get("workflow_runs")
             require(isinstance(runs, list), "run_list")
         except Rejected:
             if page == 1:
                 raise
             break
+        seen_count += len(runs)
+        if "total_count" in response:
+            total = response["total_count"]
+            if type(total) is not int or total < 0 or (expected_total is not None and total != expected_total):
+                valid_listing = False
+            expected_total = total
         for run in runs:
             try:
                 verify_run(run)
+                identity = (run["id"], run["run_attempt"])
+                if identity in listed_identities:
+                    # Pagination can shift while runs finish. A duplicated record
+                    # must not conceal a missing intermediate OFFLINE observation.
+                    valid_listing = False
+                listed_identities.add(identity)
                 result.append(run)
             except Rejected:
+                # Other event types are intentionally outside this reader. A broken
+                # record in its accepted scope is a possible missing observation.
+                if not isinstance(run, dict) or (run.get("event") in ("workflow_dispatch", "schedule")
+                        and (type(run.get("id")) is not int or run["id"] >= BASE)):
+                    valid_listing = False
                 continue
-        if len(runs) < 100 or any(isinstance(r, dict) and type(r.get("id")) is int and r["id"] <= BASE for r in runs):
+        at_baseline = any(isinstance(r, dict) and type(r.get("id")) is int and r["id"] <= BASE for r in runs)
+        if len(runs) < 100 or at_baseline:
+            result.complete = valid_listing and (at_baseline or expected_total is None or expected_total <= seen_count)
             break
     return result
 
 
+def run_times(run):
+    created, started, updated = (utc(run.get(key)) for key in ("created_at", "run_started_at", "updated_at"))
+    require(created <= started <= updated <= datetime.now(timezone.utc), "history_time")
+    return created, started, updated
+
+
+def history_needed(directory):
+    snapshot = json.loads((directory / "monitor_snapshot.json").read_text())
+    return any(room.get("platform") in ("tmall", "taobao") and room.get("code") in HISTORY_CODES
+               for room in snapshot["rooms"])
+
+
+def verified_interval(directory, run, job):
+    """Cross-check archive time against its attested run, not a refresh clock."""
+    summary = json.loads((directory / "run_summary.json").read_text())
+    started, completed = utc(summary.get("started_utc")), utc(summary.get("completed_utc"))
+    _, run_started, updated = run_times(run)
+    ended = utc(job.get("completed_at"))
+    require(run_started <= started <= completed <= ended <= updated, "history_time")
+    snapshot = json.loads((directory / "monitor_snapshot.json").read_text())
+    captured = utc(snapshot.get("generated_at"))
+    require(started <= captured <= completed and all(started <= utc(room.get("observed_at")) <= captured
+            for room in snapshot["rooms"]), "history_time")
+    return started, completed
+
+
+def acquire_history(output, selected, selected_job, listing, latest):
+    """Stage a complete, bounded chain; any gap discards the whole private chain.
+
+    The files are original validated observations, including OFFLINE rounds. They
+    never replace current inputs or participate in collector notification state.
+    """
+    unavailable = {"status": "unavailable", "entries": []}
+    if selected is None or latest is None or (latest["runId"], latest["attempt"], latest["conclusion"]) != (
+            str(selected["id"]), selected["run_attempt"], "success"):
+        return unavailable
+    try:
+        if not history_needed(output):
+            return {"status": "complete", "entries": []}
+        require(listing.complete, "history_listing_incomplete")
+        # A workflow list only exposes its latest attempt. Do not silently omit
+        # intermediate attempts, whose observations could invalidate an older LIVE.
+        require(selected["run_attempt"] == 1, "history_retry")
+        _, anchor = verified_interval(output, selected, selected_job)
+        cutoff = anchor - HISTORY_WINDOW
+        selected_updated = run_times(selected)[2]
+        candidates = {}
+        for run in listing:
+            if run["id"] == selected["id"] and run["run_attempt"] == selected["run_attempt"]:
+                require(run == selected, "history_duplicate")
+                continue
+            _, _, updated = run_times(run)
+            if updated < cutoff:
+                continue  # No download for an archive certainly outside the window.
+            require(updated <= selected_updated and run["run_attempt"] == 1, "history_retry_or_order")
+            # Failed first attempts have no accepted successful evidence. A rerun
+            # above was rejected because its hidden prior attempt may have one.
+            if run.get("conclusion") != "success":
+                continue
+            key = (run["id"], run["run_attempt"])
+            require(key not in candidates or candidates[key] == run, "history_duplicate")
+            candidates[key] = run
+        require(len(candidates) <= HISTORY_LIMIT, "history_limit")
+        entries = []
+        with tempfile.TemporaryDirectory(dir=output.parent) as work:
+            staging = Path(work) / "history"
+            staging.mkdir(mode=0o700)
+            for run in sorted(candidates.values(), key=lambda r: (utc(r["updated_at"]), r["id"]), reverse=True):
+                require(lookup_deadline is None or time.monotonic() < lookup_deadline, "lookup_timeout")
+                jobs = api(f"runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100").get("jobs")
+                job = verify_eligible_job(run, jobs)
+                directory = staging / f"{run['id']}-{run['run_attempt']}"
+                directory.mkdir(mode=0o700)
+                fetch_candidate(run, directory)
+                _, completed = verified_interval(directory, run, job)
+                require(completed <= anchor, "history_time")
+                # updated_at includes artifact upload time. A borderline old round
+                # can be validated yet contain no observations inside the window.
+                if completed >= cutoff:
+                    entries.append("history/" + directory.name)
+            require(lookup_deadline is None or time.monotonic() < lookup_deadline, "lookup_timeout")
+            staging.rename(output / "history")
+        return {"status": "complete", "entries": entries}
+    except (Rejected, OSError, UnicodeError, json.JSONDecodeError):
+        # The root selected snapshot remains usable. Never expose a partial chain.
+        print("V2 history unavailable", file=sys.stderr)
+        return unavailable
+
+
 def acquire(output):
     latest = None
+    selected = selected_job = None
     try:
         runs = runs_to_check()
         health_known = True
     except Rejected:
-        runs, health_known = [], False
+        runs, health_known = RunListing(), False
+    listing = RunListing(runs)
+    listing.complete = runs.complete
     # The reviewed first attempt is also looked up explicitly if outside the list, or rerun.
     if not any(r["id"] == BASE and r["run_attempt"] == 1 for r in runs):
         try:
@@ -266,6 +396,7 @@ def acquire(output):
                 fetch_candidate(run, candidate)
                 for file in candidate.iterdir():
                     file.replace(output / file.name)
+            selected, selected_job = run, job
             break
         except Rejected as error:
             if str(error) == "lookup_timeout":
@@ -283,6 +414,8 @@ def acquire(output):
             except Rejected:
                 pass
     (output / "latest.json").write_text(json.dumps(latest))
+    history = acquire_history(output, selected, selected_job, listing, latest)
+    (output / "history.json").write_text(json.dumps(history))
 
 
 def main(output):

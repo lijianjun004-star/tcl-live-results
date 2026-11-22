@@ -83,6 +83,20 @@ function fixture(t, rows, options = {}) {
       source: round.source, latest: options.latest || null, monitor_snapshot: round.evidence.snapshot,
       resolved_rooms: round.evidence.resolved, run_summary: round.evidence.summary, control_live_result: round.evidence.control
     })) fs.writeFileSync(path.join(env.V2_PRIVATE_DIR, file + '.json'), JSON.stringify(value));
+    if (options.history) {
+      const entries = options.history.map(previous => {
+        const entry = 'history/' + previous.source.runId + '-' + previous.source.attempt;
+        const directory = path.join(env.V2_PRIVATE_DIR, entry);
+        fs.mkdirSync(directory, { recursive: true });
+        for (const [file, value] of Object.entries({
+          source: previous.source, monitor_snapshot: previous.evidence.snapshot,
+          resolved_rooms: previous.evidence.resolved, run_summary: previous.evidence.summary,
+          control_live_result: previous.evidence.control
+        })) fs.writeFileSync(path.join(directory, file + '.json'), JSON.stringify(value));
+        return entry;
+      });
+      fs.writeFileSync(path.join(env.V2_PRIVATE_DIR, 'history.json'), JSON.stringify({ status: 'complete', entries }));
+    }
   }
   const clockFile = path.join(dir,'clock.mjs');
   fs.writeFileSync(clockFile, `const ActualDate = Date; const at = Date.parse(${JSON.stringify(NOW)}); globalThis.Date = class extends ActualDate { constructor(...args) { super(...(args.length ? args : [at])); } static now() { return at; } };`);
@@ -594,10 +608,11 @@ test('recursive privacy gate rejects hidden identifiers and diagnostics without 
   }
 });
 
-// Execute the shipped browser script against its rendered card attributes and controls.
+// Execute the shipped script against a simulated DOM and clock in Node VM.
+// This checks behavior of the actual rendered script, not Chromium or pixels.
 function openPage(html, initialTime) {
-  let clock = Date.parse(initialTime), tick, clipboard;
-  const ids = new Map(), cards = [], counts = [];
+  let clock = Date.parse(initialTime), clipboard, nextTimer = 1;
+  const ids = new Map(), cards = [], counts = [], labels = [], references = [], timers = new Map();
   const attrName = name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
   function element(attrs) {
     const events = new Map();
@@ -617,6 +632,8 @@ function openPage(html, initialTime) {
     if (node.id) ids.set(node.id, node);
     if (attrs.class === 'st') cards.push(node);
     if (Object.hasOwn(attrs, 'data-v2-count')) counts.push(node);
+    if (Object.hasOwn(attrs, 'data-v2-label')) labels.push(node);
+    if (Object.hasOwn(attrs, 'data-v2-reference')) references.push(node);
   }
   for (const [, id, content] of html.matchAll(/<script type="application\/json" id="([^"]+)">([\s\S]*?)<\/script>/g)) {
     ids.set(id, { textContent: content });
@@ -625,10 +642,32 @@ function openPage(html, initialTime) {
   const document = {
     documentElement: { classList: { add() {} } }, addEventListener() {},
     getElementById: id => ids.get(id), querySelector: selector => ids.get(selector.slice(1)),
-    querySelectorAll: selector => selector === '.st' ? cards : selector === '[data-v2-count]' ? counts : []
+    querySelectorAll: selector => selector === '.st' ? cards : selector === '[data-v2-count]' ? counts :
+      selector === '[data-v2-label]' ? labels : selector === '[data-v2-reference]' ? references : []
   };
+  function schedule(fn, delay, repeat = false) {
+    const id = nextTimer++;
+    timers.set(id, { fn, due: clock + delay, period: repeat ? delay : 0 });
+    return id;
+  }
+  function advanceClock(milliseconds) {
+    const until = clock + milliseconds;
+    let executions = 0;
+    for (;;) {
+      const next = [...timers].filter(([, timer]) => timer.due <= until).sort((a, b) => a[1].due - b[1].due || a[0] - b[0])[0];
+      if (!next) break;
+      assert.ok(++executions < 10000, 'timer simulation did not settle');
+      const [id, timer] = next;
+      clock = timer.due;
+      if (timer.period) timer.due += timer.period;
+      else timers.delete(id);
+      timer.fn();
+    }
+    clock = until;
+  }
   vm.runInNewContext(html.match(/<script>\n([\s\S]*?)<\/script>/)[1], {
-    Date: Clock, document, setInterval(fn) { tick = fn; },
+    Date: Clock, document, setInterval: (fn, delay) => schedule(fn, delay, true),
+    setTimeout: (fn, delay) => schedule(fn, delay), clearTimeout: id => timers.delete(id),
     navigator: { clipboard: { writeText(value) { clipboard = value; return Promise.resolve(); } } }
   });
   return {
@@ -639,10 +678,111 @@ function openPage(html, initialTime) {
       const [head, ...lines] = clipboard.split('\n').map(line => line.split('\t'));
       return lines.map(cells => Object.fromEntries(head.map((key, index) => [key, cells[index]])));
     },
-    advance(minutes) { clock += minutes * 60e3; tick(); },
+    advance(minutes) { advanceClock(minutes * 60e3); },
+    advanceMs(milliseconds) { advanceClock(milliseconds); },
+    visibleIds() { return cards.filter(node => !node.hidden).map(node => node.id); },
+    reference(id) { return references.find(node => node.getAttribute('data-v2-reference') === id); },
+    label(id) { return labels.find(node => node.getAttribute('data-v2-label') === id)?.textContent; },
     count(name) { return counts.find(node => node.getAttribute('data-v2-count') === name)?.textContent; }
   };
 }
+
+// A prior immutable synthetic round with the same enrollment. Only timestamps
+// and source provenance move; no real historical/live endpoint is consulted.
+function priorLiveRound(minutesBeforeCurrent, ids = ['T1', 'T2']) {
+  const previous = tenTargetRound(2);
+  previous.source.runId = '970001';
+  previous.evidence.snapshot.run_id = previous.evidence.resolved.run_id = '970001.2';
+  previous.evidence.summary.run_id = '970001';
+  for (const id of ids) {
+    const index = Number(id.slice(1)) - 1;
+    result(previous, index, 'OK', 'live', { identity_verified: true }).live_id = String(87000000000001 + index);
+  }
+  const shift = value => {
+    if (typeof value === 'string' && /^2026-11-16T\d\d:\d\d:\d\dZ$/.test(value)) {
+      return new Date(Date.parse(value) - minutesBeforeCurrent * 60000).toISOString();
+    }
+    if (Array.isArray(value)) return value.map(shift);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, shift(item)]));
+    return value;
+  };
+  previous.evidence = shift(previous.evidence);
+  return previous;
+}
+
+test('rendered recent-reference filter, copy and TSV expire automatically in the Node VM without promoting UNKNOWN', t => {
+  const round = tenTargetRound();
+  // Current T1 observation is 11:59; previous LIVE is 09:01. At the page's
+  // 12:00 opening time it has one minute left, expiring at 12:01:00.001.
+  const previous = priorLiveRound(178);
+  const f = fixture(t, [row('101')], { round, history: [previous], allTmall: true });
+  const projected = JSON.parse(fs.readFileSync(path.join(f.dir, 'out/v2.json')));
+  assert.equal(projected.historyStatus, 'complete');
+  assert.equal(projected.counts.live, 0);
+  assert.equal(projected.counts.unknown, 10);
+  assert.match(f.html, /data-v2-count="recentLive">2</);
+  assert.match(f.html, /data-v2-reference="T1"/);
+  const page = openPage(f.html, NOW);
+  page.filter('recent');
+  assert.deepEqual(page.visibleIds(), ['t1', 't2']);
+  assert.equal(page.count('recentLive'), '2');
+  assert.equal(page.count('unknown'), '10');
+  assert.equal(page.count('live'), '0');
+  assert.match(page.label('T1'), /无法判断/);
+  assert.match(page.label('T2'), /跳过，状态未知/);
+  assert.match(page.reference('T1').textContent, /最近确认在播.*本轮未确认.*17:01:00/);
+  assert.equal(page.reference('T1').hidden, false);
+  const initial = page.table();
+  assert.deepEqual(initial.map(item => item['V2 编号']), ['T1', 'T2']);
+  for (const item of initial) {
+    assert.equal(item['V2 当前状态'], '无法判断');
+    assert.equal(item['V2 有效观测'], '');
+    assert.equal(item['V2 历史在播确认时间'], '2026-11-16 17:01:00');
+    assert.equal(item['V2 历史来源批次'], '970001.2');
+    assert.match(item['V2 历史参考状态'], /历史参考.*本轮未确认/);
+  }
+  assert.match(page.text(), /历史参考.*不代表当前在播/);
+  page.advanceMs(60000);
+  assert.equal(page.count('recentLive'), '2', '180 minutes exactly is still eligible');
+  assert.deepEqual(page.visibleIds(), ['t1', 't2']);
+  page.advanceMs(1);
+  // Check before copying or selecting another filter: only the shipped expiry
+  // timer could have refreshed these DOM fields and the active filter.
+  assert.equal(page.count('recentLive'), '0');
+  assert.equal(page.count('unknown'), '10');
+  assert.equal(page.count('live'), '0');
+  assert.deepEqual(page.visibleIds(), []);
+  assert.match(page.reference('T1').textContent, /已过期/);
+  assert.deepEqual(page.table(), []);
+  page.filter('unknown');
+  assert.equal(page.visibleIds().length, 10);
+  const expired = page.table().filter(item => ['T1', 'T2'].includes(item['V2 编号']));
+  assert.equal(expired.length, 2);
+  assert.ok(expired.every(item => /已过期/.test(item['V2 历史参考状态']) && item['V2 当前状态'] === '无法判断'));
+  assert.match(page.text(), /历史在播记录已过期/);
+});
+
+test('privacy scan detects a historical-only live identifier without exposing the matched number', t => {
+  const round = tenTargetRound(), previous = priorLiveRound(178, ['T1']);
+  const privateNumber = previous.evidence.snapshot.rooms[0].live_id;
+  assert.ok(!JSON.stringify(round).includes(privateNumber), 'probe must exist only in history');
+  const f = fixture(t, [row('101')], { round, history: [previous], allTmall: true });
+  const stage = path.join(f.dir, 'history-leak-probe');
+  fs.mkdirSync(stage);
+  const scan = () => spawnSync(process.execPath, [path.join(f.scripts, 'leakcheck.mjs'), 'history-leak-probe'], {
+    cwd: f.dir, env: f.env, encoding: 'utf8'
+  });
+  fs.writeFileSync(path.join(stage, 'clean.json'), JSON.stringify({ publicId: 'T1', note: '历史参考' }));
+  assert.equal(scan().status, 0);
+  // Neutral field and filename ensure the failure comes from reading private
+  // historical values, rather than the general field-name/URL patterns.
+  fs.writeFileSync(path.join(stage, 'probe.json'), JSON.stringify({ note: privateNumber }));
+  const failure = scan();
+  assert.equal(failure.status, 2);
+  assert.match(failure.stderr, /LEAK private_value/);
+  assert.ok(!(failure.stdout + failure.stderr).includes(privateNumber));
+  assert.ok(!(failure.stdout + failure.stderr).includes(path.join(stage, 'probe.json')));
+});
 
 test('V2 browser filters, text copy and TSV use the same timestamped state after expiry', t => {
   const round = tenTargetRound();
