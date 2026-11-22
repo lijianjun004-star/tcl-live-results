@@ -6,7 +6,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import vm from 'node:vm';
+import { v2Counts, v2Export, v2State } from '../dash/v2-view.mjs';
+import { createV2Projector } from '../dash/v2.mjs';
+import { tenTargetRound, fixtureTimes, result } from './fixtures/v2.mjs';
 import { assessFreshness, assessRefresh, isCountable } from '../dash/freshness.mjs';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
@@ -26,8 +30,25 @@ function fixture(t, rows, options = {}) {
     'r326-douyin-targets-scoring-b.json': [], 'r329-douyin-targets-monitor-c.json': [], 'r329-douyin-targets-monitor-d.json': [] };
   for (const [name, items] of Object.entries(targets)) fs.writeFileSync(path.join(config, 'main-' + name), JSON.stringify({ targets: items }));
   const tmallKeys = ['synthetic_tm_primary', ...(options.tmallStopped ? ['synthetic_tm_skipped'] : []),
-    ...Array.from({length:options.fullOutage ? 7 : 0}, (_,i) => 'synthetic_tm_extra_'+i)];
-  fs.writeFileSync(path.join(config, 'main-probe-targets.json'), JSON.stringify({ douyin: dyKeys.map(key => ({key})), tmall: tmallKeys.map(key => ({key})) }));
+    ...Array.from({length:options.fullOutage ? 7 : options.allTmall ? 8 : 0}, (_,i) => 'synthetic_tm_extra_'+i)];
+  const round = options.round || tenTargetRound();
+  const tmall = tmallKeys.map((key, i) => {
+    const room = round.evidence.resolved.rooms[i];
+    const accountId = new URL(room.room_url).searchParams.get('userId');
+    return { key, accountId };
+  });
+  fs.writeFileSync(path.join(config, 'main-probe-targets.json'), JSON.stringify({ douyin: dyKeys.map(key => ({key})), tmall }));
+  // Run the same production entry points against an isolated, immutable synthetic enrollment.
+  const scripts = path.join(dir, 'dash');
+  fs.mkdirSync(path.join(scripts, 'private'), { recursive: true });
+  for (const name of fs.readdirSync(path.join(ROOT, 'dash')).filter(name => /\.(mjs|sh|py)$/.test(name))) {
+    fs.copyFileSync(path.join(ROOT, 'dash', name), path.join(scripts, name));
+  }
+  fs.copyFileSync(path.join(ROOT, 'dash/private/names.json'), path.join(scripts, 'private/names.json'));
+  const enrolled = round.registry.map((entry, i) => tmall[i] ? {
+    ...entry, legacyKeyHash: createHash('sha256').update(tmall[i].key).digest('hex')
+  } : entry);
+  fs.writeFileSync(path.join(scripts, 'private/v2-roster.json'), JSON.stringify(enrolled));
   const freshAt = new Date(Date.parse(NOW) - 60000).toISOString();
   const oldAt = new Date(Date.parse(NOW) - 6 * 3600e3).toISOString();
   const dyAt = options.staleDouyin ? oldAt : freshAt;
@@ -54,9 +75,18 @@ function fixture(t, rows, options = {}) {
   if (options.emptyDouyin) fs.writeFileSync(path.join(dir,'dy.log'),'');
   const env = { ...process.env, MAIN_DIR: config, RUN_JD: '101', RUN_DY: '102', RUN_TM: '103', GITHUB_RUN_ID: '200',
     LATEST_JD_RUN: options.latestJDRun ? JSON.stringify(options.latestJDRun) : '' };
+  delete env.V2_PRIVATE_DIR; // Shell environments can contain a real evidence path.
+  if (options.round) {
+    env.V2_PRIVATE_DIR = path.join(dir, 'v2-input');
+    fs.mkdirSync(env.V2_PRIVATE_DIR);
+    for (const [file, value] of Object.entries({
+      source: round.source, latest: options.latest || null, monitor_snapshot: round.evidence.snapshot,
+      resolved_rooms: round.evidence.resolved, run_summary: round.evidence.summary, control_live_result: round.evidence.control
+    })) fs.writeFileSync(path.join(env.V2_PRIVATE_DIR, file + '.json'), JSON.stringify(value));
+  }
   const clockFile = path.join(dir,'clock.mjs');
   fs.writeFileSync(clockFile, `const ActualDate = Date; const at = Date.parse(${JSON.stringify(NOW)}); globalThis.Date = class extends ActualDate { constructor(...args) { super(...(args.length ? args : [at])); } static now() { return at; } };`);
-  const run = file => spawnSync(process.execPath, ['--import', pathToFileURL(clockFile).href, path.join(ROOT, 'dash', file)], { cwd: dir, env, encoding: 'utf8' });
+  const run = file => spawnSync(process.execPath, ['--import', pathToFileURL(clockFile).href, path.join(scripts, file)], { cwd: dir, env, encoding: 'utf8' });
   const build = run('build.mjs');
   if (options.expectBuildFailure) return { build, dir };
   assert.equal(build.status, 0, build.stderr);
@@ -69,7 +99,7 @@ function fixture(t, rows, options = {}) {
   assert.equal(render.status, 0, render.stderr);
   const html = fs.readFileSync(path.join(dir, 'universal/index.html'), 'utf8');
   const recs = JSON.parse(html.match(/<script type="application\/json" id="rec">([\s\S]*?)<\/script>/)[1]).rows;
-  return { data, html, recs, dir, env, dyAt, freshAt, samples, runs };
+  return { data, html, recs, dir, env, dyAt, freshAt, samples, runs, run, scripts };
 }
 
 test('preflight replay excludes old JD data from today and separates an unsuccessful latest attempt', t => {
@@ -265,7 +295,7 @@ exit 8
 `, { mode: 0o700 });
   function refresh(dirName, failTimeline) {
     const work = path.join(f.dir, dirName);
-    fs.cpSync(path.join(ROOT, 'dash'), work, { recursive: true });
+    fs.cpSync(f.scripts, work, { recursive: true });
     const result = spawnSync('bash', ['refresh.sh'], { cwd: work, encoding: 'utf8', env: {
       ...f.env, PATH: bin + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH,
       FIXTURES: f.dir, FAIL_TIMELINE: failTimeline, MAIN_DIR: path.join(work, 'config'),
@@ -303,4 +333,422 @@ test('publisher reports PUBLISHED only after successful refresh, deployment and 
   const summary=fs.readFileSync(path.join(dir,'summary.md'),'utf8');
   assert.match(summary,/actions\/runs\/12345/);
   assert.match(summary,/actions\/runs\/67890/);
+});
+
+function project(round) {
+  return createV2Projector(round.registry)(round.evidence, round.source);
+}
+
+test('ten enrolled targets reconcile against the first-round shape in either input order', () => {
+  const round = tenTargetRound(), model = project(round);
+  assert.deepEqual(model.counts, { covered: 10, live: 0, offline: 0, replay: 0, unknown: 10, skipped: 6, uncalibrated: 0, assessedValid: 0 });
+  assert.deepEqual(model.rows.map(r => r.id), ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8', 'T9', 'J-C01']);
+  for (const r of model.rows) {
+    assert.equal(r.role, r.id === 'T1' ? 'assessed' : r.id === 'J-C01' ? 'candidate' : 'monitor');
+    const attempted = ['T1', 'T4', 'T7', 'J-C01'].includes(r.id);
+    assert.equal(r.skipped, !attempted);
+    const rawTime = r.id === 'J-C01' ? fixtureTimes.discovery : attempted ? fixtureTimes.challenge : fixtureTimes.skip;
+    assert.equal(r.recordedAt, new Date(rawTime).toISOString());
+    assert.equal(r.attemptedAt, attempted ? r.recordedAt : null);
+    assert.equal(r.verifiedAt, null);
+    assert.equal(r.status, 'unknown');
+    assert.equal(r.reason, r.id === 'J-C01' ? 'no_candidate' : attempted ? 'challenge' : 'circuit');
+  }
+  assert.equal(model.source.control, 'not_configured');
+  round.evidence.snapshot.rooms.reverse();
+  round.evidence.resolved.rooms.push(round.evidence.resolved.rooms.shift());
+  assert.deepEqual(project(round), model);
+  const rerun = tenTargetRound(2), second = project(rerun);
+  assert.equal(second.source.attempt, 2);
+  assert.deepEqual(second.rows, model.rows);
+  assert.deepEqual(second.counts, model.counts);
+  assert.throws(() => createV2Projector(rerun.registry)(rerun.evidence, round.source));
+});
+
+test('evidence, roles and offline calibration control the point-in-time assessment', () => {
+  const round = tenTargetRound();
+  const identity = { identity_verified: true };
+  const offline = { ...identity, offline_evidence: true, offline_rule_validated: true };
+  result(round, 0, 'OK', 'live', identity).live_id = '86000001';
+  result(round, 1, 'OFFLINE', 'offline', offline);
+  result(round, 2, 'OFFLINE', 'replay', offline);
+  result(round, 3, 'OFFLINE', 'offline', { ...offline, offline_rule_validated: false });
+  result(round, 4, 'OFFLINE', 'offline', { ...offline, offline_evidence: false });
+  result(round, 5, 'OK', 'live', { identity_verified: false }).live_id = '86000006';
+  result(round, 6, 'OK', 'live', identity).live_id = null;
+  result(round, 7, 'LOGIN_REQUIRED');
+  result(round, 8, 'NAV_TIMEOUT');
+  const model = project(round);
+  assert.deepEqual(model.rows.map(r => r.status), ['live', 'offline', 'replay', ...Array(7).fill('unknown')]);
+  assert.deepEqual(model.rows.slice(7).map(r => r.reason), ['login', 'timeout', 'no_candidate']);
+  assert.equal(model.rows[3].reason, 'uncalibrated');
+  assert.ok(model.rows.slice(0, 3).every(r => r.verifiedAt === r.recordedAt));
+  assert.ok(model.rows.slice(3).every(r => r.verifiedAt === null));
+  assert.equal(model.counts.assessedValid, 1);
+  result(round, 0, 'REDIRECTED');
+  result(round, 1, 'POST_AUDIT_BLOCKED');
+  const blocked = project(round);
+  assert.equal(blocked.counts.assessedValid, 0);
+  assert.deepEqual(blocked.rows.slice(0, 2).map(r => r.reason), ['redirect', 'blocked']);
+});
+
+test('JD candidate links and apparent live results alone cannot prove the enrolled shop is live', () => {
+  for (const verification of ['candidate_unverified', 'resolved_link']) {
+    const round = tenTargetRound();
+    const raw = result(round, 9, 'OK', 'live', { identity_verified: true });
+    const discovered = round.evidence.resolved.rooms[9];
+    raw.live_id = '86000011';
+    raw.room_url = 'https://lives.jd.com/#/' + raw.live_id;
+    Object.assign(discovered, { source: 'fresh', code: 'OK', reason: null, live_id: raw.live_id, room_url: raw.room_url, verification });
+    Object.assign(raw.discovery, { source: 'fresh', code: 'OK', reason: null });
+    const candidate = project(round).rows[9];
+    assert.equal(candidate.status, 'unknown');
+    assert.equal(candidate.verifiedAt, null);
+    assert.equal(candidate.role, 'candidate');
+  }
+});
+
+test('zero-request skips require corroboration and a blocked request never becomes verified', () => {
+  const round = tenTargetRound();
+  for (const [index, diagnostics] of [[1, {}], [2, { network_requests: 1 }]]) {
+    round.evidence.snapshot.rooms[index].diagnostics = diagnostics;
+  }
+  const model = project(round);
+  assert.equal(model.counts.skipped, 4);
+  assert.ok(model.rows.slice(1, 3).every(r => !r.skipped && r.status === 'unknown' && r.verifiedAt === null && r.reason !== 'circuit'));
+});
+
+test('invalid enrollment, handoff or provenance fails before producing a projection', () => {
+  const changes = [
+    ['missing row', e => e.snapshot.rooms.pop()],
+    ['duplicate key', e => { e.resolved.rooms[1].target_key = e.resolved.rooms[0].target_key; }],
+    ['extra key', e => { e.snapshot.rooms[0].target_key = 'new-unapproved-shop'; }],
+    ['substituted platform', e => { e.snapshot.rooms[0].platform = 'jd'; }],
+    ['swapped anchor', e => { e.resolved.rooms[0].room_url = e.resolved.rooms[1].room_url; }],
+    ['substituted display identity', e => { e.snapshot.rooms[0].display_name = '其他门店'; }],
+    ['unknown snapshot schema', e => { e.snapshot.schema_version = '1.0'; }],
+    ['unknown discovery schema', e => { e.resolved.schema_version = '3.0'; }],
+    ['snapshot and discovery from different attempts', e => { e.resolved.run_id = '970003.99'; }],
+    ['substituted registered JD shop ID', e => { e.resolved.rooms[9].audit.shop.shop_id = '86000099'; }],
+    ['inconsistent control', e => { e.summary.positive_live_control = true; }],
+    ['wrong source repository', e => { e.summary.repository = 'synthetic/other'; }],
+    ['wrong source branch', e => { e.summary.branch = 'other'; }],
+    ['non-live run', e => { e.summary.engine = 'fixture'; }],
+    ['wrong source revision', e => { e.summary.head_sha = 'b'.repeat(40); }],
+    ['unvalidated schema handoff', e => { e.summary.contract_validation.monitor_snapshot = 'error'; }],
+    ['summary total', e => { e.summary.targets_total++; }],
+    ['summary code counts', e => { e.summary.by_code.GROUP_CIRCUIT_OPEN++; }],
+    ['snapshot platform counts', e => { e.snapshot.summary.by_platform.jd++; }],
+    ['schema-inconsistent status', e => { e.snapshot.rooms[0].live_status = 'offline'; }],
+    ['unexpected schema field', e => { e.snapshot.rooms[0].undocumented = true; }]
+  ];
+  const duplicated = tenTargetRound();
+  duplicated.registry[1].id = 'T1';
+  assert.throws(() => project(duplicated));
+  for (const [label, change] of changes) {
+    const round = tenTargetRound();
+    change(round.evidence);
+    assert.throws(() => project(round), undefined, label);
+  }
+});
+
+test('public V2 projection strips source URLs, enrolled names, diagnostic payloads and private fields', () => {
+  const round = tenTargetRound();
+  const row = round.evidence.snapshot.rooms[0];
+  row.diagnostics.operator_note = 'sentinel-sensitive-value';
+  row.item_title = 'sentinel-hidden-item';
+  const model = project(round), output = JSON.stringify(model);
+  const allowed = ['id', 'platform', 'role', 'recordedAt', 'attemptedAt', 'verifiedAt', 'status', 'reason', 'skipped'].sort();
+  for (const r of model.rows) assert.deepEqual(Object.keys(r).sort(), allowed);
+  for (const secret of [row.target_key, row.display_name, row.room_url, row.diagnostics.operator_note, row.item_title, 'CAPTCHA_X5SEC', 'account_group', 'room_url', 'diagnostics', 'thumbnail']) {
+    assert.ok(!output.includes(secret), 'private evidence present in projection');
+  }
+});
+
+test('each V2 clock is evaluated at 180 minutes, +5 minutes and its own Beijing day boundary', () => {
+  const round = tenTargetRound();
+  result(round, 0, 'OK', 'live', { identity_verified: true }).live_id = '86000001';
+  const valid = project(round).rows[0];
+  const at = Date.parse(valid.verifiedAt);
+  for (const [difference, expected] of [[180 * 60000, 'CURRENT'], [180 * 60000 + 1, 'STALE'], [-5 * 60000, 'CURRENT'], [-5 * 60000 - 1, 'UNKNOWN']]) {
+    const state = v2State(valid, at + difference);
+    assert.equal(state.age, expected);
+    assert.equal(state.current, expected === 'CURRENT' ? 'live' : 'unknown');
+    assert.equal(v2Counts([valid], at + difference).assessedValid, expected === 'CURRENT' ? 1 : 0);
+  }
+  for (const [platform, iso] of [['jd', '2026-11-16T16:00:00Z'], ['tmall', '2026-11-16T22:00:00Z']]) {
+    const cutover = Date.parse(iso), verifiedAt = new Date(cutover - 1000).toISOString();
+    const row = { ...valid, platform, verifiedAt, attemptedAt: verifiedAt, recordedAt: verifiedAt };
+    assert.equal(v2State(row, cutover - 1).current, 'live');
+    assert.equal(v2State(row, cutover).age, 'STALE');
+    assert.equal(v2Export(row, cutover).age, '历史');
+    assert.equal(v2Export(row, cutover).status, '无法判断');
+  }
+  assert.equal(v2State({ ...valid, verifiedAt: null }, at).current, 'unknown');
+  const skipped = project(round).rows[1];
+  assert.equal(v2Export(skipped, at).attempt, '');
+  assert.equal(v2Export(skipped, at).verified, '');
+  assert.match(v2Export(skipped, at).schedule, /19:59:03$/);
+});
+
+test('rendered records join nine existing Tmall cards and isolate the JD candidate from daily totals', t => {
+  const round = tenTargetRound();
+  const v2 = { ...project(round), latest: { runId: '970004', attempt: 1, at: NOW, conclusion: 'failure' } };
+  const base = fixture(t, [row('101'), row('101', PREV)], { allTmall: true });
+  const f = fixture(t, [row('101'), row('101', PREV)], { round, latest: v2.latest, allTmall: true });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dir, 'out/v2.json'))), v2);
+  for (const dataset of ['jd', 'douyin', 'tmall', 'runs', 'samples']) {
+    const filename = path.join('out', dataset + '.json');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dir, filename))), JSON.parse(fs.readFileSync(path.join(base.dir, filename))));
+  }
+  const oldCount = base.recs.length;
+  assert.equal(f.recs.length, oldCount + 1);
+  const ui = f.html.split('<script')[0];
+  for (const r of v2.rows) {
+    const slug = r.id === 'J-C01' ? 'jc01' : r.id.toLowerCase();
+    assert.equal(ui.split('id="' + slug + '"').length - 1, 1);
+    assert.equal(ui.split('data-v2-code="' + r.id + '"').length - 1, 1);
+    assert.equal(ui.includes('data-v2-point="' + r.id + '"'), !r.skipped);
+  }
+  assert.match(ui, /data-v2-round="skipped">6</);
+  assert.match(ui, /data-v2-round="unknown">10</);
+  assert.match(ui, /data-v2-round="assessedValid">0</);
+  assert.match(ui, /本轮无有效样本/);
+  assert.match(ui, /店铺页未发现候选场次/);
+  assert.match(ui, /未配置正控/);
+  assert.match(ui, /最近完成的 V2 采集任务[\s\S]{0,140}失败/);
+  assert.match(ui, /19:58:57/);
+  assert.match(ui, /19:59:03/);
+  assert.match(f.html, /name="viewport"/);
+  assert.match(f.html, /id="v2-filter"/);
+  new vm.Script(f.html.match(/<script>\n([\s\S]*?)<\/script>/)[1]);
+  const candidate = f.recs.find(r => r.id === 'jc01');
+  for (const key of ['minutes', 'dayRate', 'prevRate']) assert.ok(candidate[key] === null || candidate[key] === '', key + ' must be empty');
+  assert.equal(candidate.v2.id, 'J-C01');
+  assert.equal(f.recs.find(r => r.id === 't1').status, base.recs.find(r => r.id === 't1').status);
+  assert.match(base.html, /暂无可核验的 V2 证据/);
+});
+
+test('recursive privacy gate rejects hidden identifiers and diagnostics without echoing the contents', t => {
+  const f = fixture(t, [row('101')]);
+  const evidenceDir = path.join(f.dir, 'private-round'), staged = path.join(f.dir, 'stage');
+  const nested = path.join(staged, 'nested');
+  fs.mkdirSync(evidenceDir);
+  fs.mkdirSync(nested, { recursive: true });
+  const { evidence } = tenTargetRound();
+  for (const [name, data] of [['monitor_snapshot', evidence.snapshot], ['resolved_rooms', evidence.resolved], ['run_summary', evidence.summary], ['control_live_result', evidence.control]]) {
+    fs.writeFileSync(path.join(evidenceDir, name + '.json'), JSON.stringify(data));
+  }
+  const scan = () => spawnSync(process.execPath, [path.join(ROOT, 'dash/leakcheck.mjs'), 'stage'], {
+    cwd: f.dir, env: { ...f.env, V2_PRIVATE_DIR: evidenceDir }, encoding: 'utf8'
+  });
+  const secret = evidence.snapshot.rooms[0].target_key;
+  const secretNumber = new URL(evidence.snapshot.rooms[0].room_url).searchParams.get('userId');
+  const approvedName = JSON.parse(fs.readFileSync(path.join(ROOT, 'dash/private/names.json'))).names.T1.name;
+  fs.copyFileSync(path.join(f.dir, 'universal/index.html'), path.join(staged, 'index.html'));
+  const clean = scan();
+  assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+  const privateCases = [
+    ['page.html', '<i data-hint="' + secret + '"></i>'],
+    ['escaped.html', '<i title="' + secret.replace('-', '&#45;') + '"></i>'],
+    ['embedded.html', '<script type="application/json">{"note":"' + secret.replace('-', '\\u002d') + '"}</script>'],
+    ['out.json', JSON.stringify({ note: secretNumber })],
+    ['export.tsv', '测试列\n' + approvedName],
+    ['copy.html', '<a href="https://example.invalid/r?token=fixture-token">查看</a>'],
+    ['debug.json', '{"diagnostics":{}}'],
+    ['monitor_snapshot.json', '{}'],
+    ['thumb.jpg', Buffer.from([0xff, 0xd8, 0xff])],
+    ['state.zip', Buffer.from('synthetic')]
+  ];
+  for (const [name, payload] of privateCases) {
+    fs.writeFileSync(path.join(nested, name), payload);
+    const failure = scan();
+    assert.equal(failure.status, 2, 'accepted ' + name);
+    for (const value of [secret, secretNumber, approvedName, 'fixture-token', path.join(nested, name)]) {
+      assert.ok(!(failure.stdout + failure.stderr).includes(value), 'diagnostic contained raw input');
+    }
+    fs.unlinkSync(path.join(nested, name));
+  }
+});
+
+// Execute the shipped browser script against its rendered card attributes and controls.
+function openPage(html, initialTime) {
+  let clock = Date.parse(initialTime), tick, clipboard;
+  const ids = new Map(), cards = [], counts = [];
+  const attrName = name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+  function element(attrs) {
+    const events = new Map();
+    return {
+      id: attrs.id, value: attrs.id === 'v2-filter' ? 'all' : '', dataset: Object.fromEntries(
+        Object.entries(attrs).filter(([name]) => name.startsWith('data-')).map(([name, value]) => [attrName(name), value])),
+      getAttribute: name => attrs[name], hasAttribute: name => Object.hasOwn(attrs, name),
+      setAttribute(name, value) { attrs[name] = value; if (name.startsWith('data-')) this.dataset[attrName(name)] = value; },
+      toggleAttribute(name, present) { if (present) this.setAttribute(name, ''); else delete attrs[name]; },
+      addEventListener: (event, cb) => events.set(event, cb), emit: event => events.get(event)?.()
+    };
+  }
+  const markup = html.split('<script')[0];
+  for (const tag of markup.matchAll(/<(?:details|select|input|button|textarea|p|div|span|b)\b([^>]+)>/g)) {
+    const attrs = Object.fromEntries([...tag[1].matchAll(/\s+([\w:-]+)(?:="([^"]*)")?/g)].map(m => [m[1], m[2] || '']));
+    const node = element(attrs);
+    if (node.id) ids.set(node.id, node);
+    if (attrs.class === 'st') cards.push(node);
+    if (Object.hasOwn(attrs, 'data-v2-count')) counts.push(node);
+  }
+  for (const [, id, content] of html.matchAll(/<script type="application\/json" id="([^"]+)">([\s\S]*?)<\/script>/g)) {
+    ids.set(id, { textContent: content });
+  }
+  class Clock extends Date { static now() { return clock; } }
+  const document = {
+    documentElement: { classList: { add() {} } }, addEventListener() {},
+    getElementById: id => ids.get(id), querySelector: selector => ids.get(selector.slice(1)),
+    querySelectorAll: selector => selector === '.st' ? cards : selector === '[data-v2-count]' ? counts : []
+  };
+  vm.runInNewContext(html.match(/<script>\n([\s\S]*?)<\/script>/)[1], {
+    Date: Clock, document, setInterval(fn) { tick = fn; },
+    navigator: { clipboard: { writeText(value) { clipboard = value; return Promise.resolve(); } } }
+  });
+  return {
+    filter(value) { const filter = ids.get('v2-filter'); filter.value = value; filter.emit('change'); },
+    text() { ids.get('cp').emit('click'); return clipboard; },
+    table() {
+      ids.get('cpx').emit('click');
+      const [head, ...lines] = clipboard.split('\n').map(line => line.split('\t'));
+      return lines.map(cells => Object.fromEntries(head.map((key, index) => [key, cells[index]])));
+    },
+    advance(minutes) { clock += minutes * 60e3; tick(); },
+    count(name) { return counts.find(node => node.getAttribute('data-v2-count') === name)?.textContent; }
+  };
+}
+
+test('V2 browser filters, text copy and TSV use the same timestamped state after expiry', t => {
+  const round = tenTargetRound();
+  result(round, 0, 'OK', 'live', { identity_verified: true }).live_id = '86000001';
+  const f = fixture(t, [row('101')], { round, allTmall: true });
+  const browser = openPage(f.html, NOW);
+  browser.filter('live');
+  const [initial] = browser.table();
+  assert.equal(initial['V2 编号'], 'T1');
+  assert.equal(initial['V2 当前状态'], '采样时在播');
+  assert.equal(initial['V2 有效观测'], '2026-11-16 19:59:00');
+  assert.equal(browser.count('live'), '1');
+  browser.filter('skipped');
+  const skipped = browser.table();
+  assert.deepEqual(skipped.map(r => r['V2 编号']), ['T2', 'T3', 'T5', 'T6', 'T8', 'T9']);
+  assert.ok(skipped.every(r => r['V2 调度登记'] && !r['V2 有效观测'] && !r['V2 采样尝试']));
+  assert.match(browser.text(), /跳过，状态未知/);
+  browser.filter('covered');
+  const candidate = browser.table().find(r => r['V2 编号'] === 'J-C01');
+  assert.equal(candidate['当天累计分钟'], '');
+  assert.equal(candidate['当天满播率'], '');
+  browser.filter('live');
+  browser.advance(181);
+  assert.deepEqual(browser.table(), []);
+  assert.equal(browser.count('live'), '0');
+  browser.filter('historical');
+  const expired = browser.table();
+  assert.equal(expired.length, 10);
+  const t1 = expired.find(r => r['V2 编号'] === 'T1');
+  assert.equal(t1['V2 本轮记录'], initial['V2 本轮记录']);
+  assert.equal(t1['V2 当前状态'], '无法判断');
+  assert.equal(t1['V2 有效观测'], initial['V2 有效观测']);
+  assert.match(browser.text(), /历史记录 · 采样时在播/);
+});
+
+test('delivery, archiving, state advance and canary health do not promote any store', () => {
+  const round = tenTargetRound(), base = project(round);
+  const checks = [
+    [{ kind: 'bark', status: 'sent' }, 'sent', 'synced', 'synced'],
+    [{ kind: 'bark', status: 'no_changes' }, 'no_changes', 'error', 'failed'],
+    [{ kind: 'bark', status: 'transport_error' }, 'failed', 'unrecognized', 'unknown'],
+    [{ status: 'sent' }, 'unknown', null, 'unknown'],
+    [{ kind: 'other', status: 'sent' }, 'not_bark', null, 'unknown']
+  ];
+  for (const [notification, delivery, drive, archive] of checks) {
+    round.evidence.summary.notification = notification;
+    round.evidence.summary.state_snapshot_advanced = false;
+    round.evidence.drive = { status: drive, report_file_id: 'synthetic-sensitive-drive-id' };
+    const model = project(round);
+    assert.equal(model.source.notification, delivery);
+    assert.equal(model.source.archive, archive);
+    assert.equal(model.source.stateAdvanced, false);
+    assert.deepEqual(model.rows, base.rows);
+    assert.deepEqual(model.counts, base.counts);
+    assert.ok(!JSON.stringify(model).includes(round.evidence.drive.report_file_id));
+  }
+  const { snapshot, summary, control } = round.evidence, target = snapshot.rooms[0];
+  Object.assign(snapshot.canary, { target_key: target.target_key, passed: false, code: target.code, live_status: target.live_status });
+  Object.assign(control, { target_key: target.target_key, status: 'not_run_room_unresolved', code: target.code });
+  summary.verdict = 'canary_failed';
+  assert.equal(project(round).source.control, 'unresolved');
+  assert.deepEqual(project(round).counts, base.counts);
+  result(round, 0, 'OK', 'live', { identity_verified: true }).live_id = '86000001';
+  Object.assign(snapshot.canary, { passed: true, code: 'OK', live_status: 'live' });
+  Object.assign(control, { status: 'observed', positive_live_control: true, room_id: target.live_id,
+    code: 'OK', live_status: 'live', page_loaded: true, login_or_captcha_blocked: false, room_id_matched: true });
+  Object.assign(summary, { positive_live_control: true, verdict: 'canary_passed' });
+  const passed = project(round);
+  assert.equal(passed.source.control, 'passed');
+  assert.equal(passed.counts.live, 1);
+  assert.deepEqual(passed.rows.slice(1), base.rows.slice(1));
+});
+
+test('an invalid or out-of-round per-store clock never inherits the source or build time', () => {
+  for (const stamp of ['2026-02-31T11:59:00Z', fixtureTimes.end, '2026-11-15T11:59:00Z']) {
+    const round = tenTargetRound();
+    const room = result(round, 0, 'OK', 'live', { identity_verified: true });
+    Object.assign(room, { live_id: '86000001', observed_at: stamp });
+    const model = project(round);
+    assert.equal(model.rows[0].status, 'unknown');
+    assert.equal(model.rows[0].reason, 'time');
+    for (const k of ['verifiedAt', 'attemptedAt', 'recordedAt']) assert.equal(model.rows[0][k], null);
+    assert.equal(model.counts.assessedValid, 0);
+  }
+});
+
+test('missing evidence keeps recent run health and an invalid private handoff writes no build', t => {
+  const f = fixture(t, [row('101')]);
+  const privateDir = path.join(f.dir, 'round');
+  fs.mkdirSync(privateDir);
+  f.env.V2_PRIVATE_DIR = privateDir;
+  const latest = { runId: '970004', attempt: 3, at: NOW, conclusion: 'failure' };
+  fs.writeFileSync(path.join(privateDir, 'latest.json'), JSON.stringify(latest));
+  assert.equal(f.run('build.mjs').status, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dir, 'out/v2.json'))), { source: null, rows: [], counts: null, latest });
+  fs.rmSync(path.join(f.dir, 'out'), { recursive: true });
+  fs.writeFileSync(path.join(privateDir, 'source.json'), JSON.stringify(tenTargetRound().source));
+  assert.notEqual(f.run('build.mjs').status, 0);
+  assert.ok(!fs.existsSync(path.join(f.dir, 'out/v2.json')));
+  assert.ok(!fs.existsSync(path.join(f.dir, 'out/jd.json')));
+});
+
+test('reordering the legacy registry preserves daily and timeline labels, and a replaced identity fails closed', t => {
+  const f = fixture(t, [row('101')], { tmallStopped: true, explicitNotRun: true });
+  const filename = path.join(f.env.MAIN_DIR, 'main-probe-targets.json');
+  const config = JSON.parse(fs.readFileSync(filename));
+  const dailyRows = () => JSON.parse(fs.readFileSync(path.join(f.dir, 'out/tmall.json'))).rows;
+  const baseline = dailyRows();
+  assert.equal(baseline.find(r => r.shop === 'T1').now, '无法判断');
+  assert.equal(baseline.find(r => r.shop === 'T2').now, '—');
+  config.tmall.reverse();
+  fs.writeFileSync(filename, JSON.stringify(config));
+  for (const name of ['build.mjs', 'samples.mjs']) {
+    const checked = f.run(name);
+    assert.equal(checked.status, 0, checked.stderr);
+  }
+  assert.deepEqual(dailyRows(), baseline);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dir, 'out/samples.json'))), f.samples);
+  for (const altered of [
+    [{ ...config.tmall[0], accountId: '8999999999' }, config.tmall[1]],
+    [{ ...config.tmall[0], key: 'unregistered-replacement' }, config.tmall[1]],
+    [config.tmall[0], config.tmall[0]]
+  ]) {
+    fs.writeFileSync(filename, JSON.stringify({ ...config, tmall: altered }));
+    for (const name of ['build.mjs', 'samples.mjs']) {
+      const rejected = f.run(name);
+      assert.notEqual(rejected.status, 0, 'accepted substituted legacy identity');
+      assert.ok(!rejected.stderr.includes('8999999999'));
+      assert.ok(!rejected.stderr.includes('unregistered-replacement'));
+    }
+  }
 });

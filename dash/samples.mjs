@@ -8,14 +8,16 @@
 // run's daily ledger. NOT_RUN is never plotted as a visit or used as an observation.
 // Output: out/samples.json. Accounts are masked (#n, Tn); no real identifiers are written.
 import fs from 'node:fs';
+import { legacyTmallLabels } from './tmall-labels.mjs';
 const M = (process.env.MAIN_DIR || '/tmp/mainsrc') + '/main-';   // config files fetched from main by refresh.sh
 const strip = l => l.replace(/\x1b\[[0-9;]*m/g, '').replace(/^[^\t]*\t[^\t]*\t[^ ]*Z /, '');
 const tsOf = l => (l.match(/\t[﻿]?(\d{4}-\d\d-\d\dT[\d:.]+Z) /) || [])[1] || null;
 const keysOf = f => JSON.parse(fs.readFileSync(M + f.replace(/^config\//, ''), 'utf8')).targets.map(t => t.key);
 const dyKeys = [...keysOf('config/r316-douyin-rpa-targets.json'), ...keysOf('config/r326-douyin-targets-scoring-b.json'), ...keysOf('config/r329-douyin-targets-monitor-c.json'), ...keysOf('config/r329-douyin-targets-monitor-d.json')];
-const tmKeys = JSON.parse(fs.readFileSync(M + 'probe-targets.json', 'utf8')).tmall.map(t => t.key);
+const tmTargets = JSON.parse(fs.readFileSync(M + 'probe-targets.json', 'utf8')).tmall;
+const tmKeys = tmTargets.map(t => t.key); // Collector order is still needed to prove a legacy stop suffix.
 const label = { douyin: k => { const i = dyKeys.indexOf(k); if (i < 0) throw new Error('DY_KEY_UNMAPPED'); return '#' + (i + 1); },
-  tmall: k => { const i = tmKeys.indexOf(k); if (i < 0) throw new Error('TM_KEY_UNMAPPED'); return 'T' + (i + 1); } };
+  tmall: legacyTmallLabels(tmTargets) };
 const OWN = new Set(['OWNER_HEADER_LIVE_ANCHOR', 'REGISTERED_ROOM_LIVE_ANCHOR']);
 const bjDay = iso => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
 const bday = iso => bjDay(new Date(Date.parse(iso) - 6 * 3600e3).toISOString());
