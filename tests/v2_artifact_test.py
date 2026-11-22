@@ -308,6 +308,37 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(self.requests[download], 1)
         self.assertEqual(self.requests[f"runs/{RUN_ID}/attempts/1"], 0)
 
+    def test_earlier_rounds_inside_180_minutes_are_staged_only_for_display(self):
+        newest = {**run_record(), "id": RUN_ID + 2, "event": "schedule", "updated_at": "2026-11-16T12:10:00Z"}
+        inside = {**run_record(), "id": RUN_ID + 1, "updated_at": "2026-11-16T12:00:00Z"}
+        outside = {**run_record(), "id": RUN_ID, "updated_at": "2026-11-16T08:00:00Z"}
+        self.provide(newest)
+        inside_download = self.provide(inside)
+        outside_download = self.provide(outside)
+        clock = patch.object(fetch, "utc_now", return_value=fetch.utc("2026-11-16T12:30:00Z"))
+        clock.start()
+        self.addCleanup(clock.stop)
+        latest, selected = self.acquire([newest, inside, outside])
+        self.assertEqual((latest["runId"], selected["runId"]), (str(newest["id"]), str(newest["id"])))
+        earlier = self.output / "previous"
+        self.assertEqual(sorted(path.name for path in earlier.iterdir()), ["1"])
+        self.assertEqual(json.loads((earlier / "1/source.json").read_text())["runId"], str(inside["id"]))
+        self.assertEqual(self.requests[inside_download], 1)
+        self.assertEqual(self.requests[outside_download], 0)
+        self.assertEqual(self.requests[f"runs/{RUN_ID}/attempts/1/jobs?per_page=100"], 0)
+
+    def test_an_unreadable_earlier_round_never_changes_the_selection(self):
+        newest = {**run_record(), "id": RUN_ID + 1, "updated_at": "2026-11-16T12:10:00Z"}
+        broken = {**run_record(), "id": RUN_ID, "updated_at": "2026-11-16T12:00:00Z"}
+        self.provide(newest)
+        self.provide(broken, room_count=6)
+        clock = patch.object(fetch, "utc_now", return_value=fetch.utc("2026-11-16T12:30:00Z"))
+        clock.start()
+        self.addCleanup(clock.stop)
+        latest, selected = self.acquire([newest, broken])
+        self.assertEqual(selected["runId"], str(newest["id"]))
+        self.assertFalse((self.output / "previous").exists())
+
     def test_all_artifacts_expired_or_skipped_preserves_only_latest_live_job_health(self):
         expired = run_record()
         skipped = {**expired, "id": RUN_ID + 1}

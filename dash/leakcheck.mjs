@@ -33,9 +33,14 @@ function readPrivateValues(value, key = '') {
 }
 const privateDir = process.env.V2_PRIVATE_DIR;
 if (privateDir) {
-  for (const name of ['monitor_snapshot','resolved_rooms','control_live_result','run_summary','drive_status']) {
-    const file = path.join(privateDir, name + '.json');
-    if (fs.existsSync(file)) readPrivateValues(JSON.parse(fs.readFileSync(file, 'utf8')));
+  // Earlier rounds staged for the display-only carry-over hold the same kinds of private values.
+  const earlierRoot = path.join(privateDir, 'previous');
+  const dirs = [privateDir, ...(fs.existsSync(earlierRoot) ? fs.readdirSync(earlierRoot).filter(n => /^[1-9]$/.test(n)).map(n => path.join(earlierRoot, n)) : [])];
+  for (const dir of dirs) {
+    for (const name of ['monitor_snapshot','resolved_rooms','control_live_result','run_summary','drive_status']) {
+      const file = path.join(dir, name + '.json');
+      if (fs.existsSync(file)) readPrivateValues(JSON.parse(fs.readFileSync(file, 'utf8')));
+    }
   }
 }
 const names = JSON.parse(fs.readFileSync(fileURLToPath(new URL('./private/names.json', import.meta.url)), 'utf8')).names;

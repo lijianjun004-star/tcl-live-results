@@ -25,6 +25,9 @@ INPUTS = {"monitor_snapshot.json", "resolved_rooms.json", "run_summary.json", "c
 REQUIRED = INPUTS | {"index.html", "SHA256SUMS.txt"}
 MAX_BYTES = 32 * 1024 * 1024
 CONCLUSIONS = {"success", "failure", "cancelled", "timed_out", "action_required", "neutral", "stale", "startup_failure"}
+# Display-only continuity (dash/v2.mjs carryForward): up to six earlier verified rounds from the last 180 minutes.
+PREVIOUS_LIMIT = 6
+CARRY_WINDOW_SECONDS = 180 * 60
 # This optional reader shares a 15-minute publication job with the legacy refresh.
 lookup_deadline = None
 
@@ -227,8 +230,47 @@ def runs_to_check():
     return result
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def acquire_previous(output, selected, runs, checked):
+    """Stage earlier verified rounds under output/previous/<n>. Never changes the selected round."""
+    cutoff = utc_now().timestamp() - CARRY_WINDOW_SECONDS
+    runs = sorted((r for r in runs if (r["id"], r["run_attempt"]) not in checked and r["id"] != selected["id"]),
+                  key=lambda r: (r.get("updated_at") or "", r["id"], r["run_attempt"]), reverse=True)
+    kept, seen = 0, set()
+    for run in runs:
+        key = (run["id"], run["run_attempt"])
+        if kept >= PREVIOUS_LIMIT or key in seen:
+            continue
+        seen.add(key)
+        try:
+            if utc(run.get("updated_at")).timestamp() < cutoff:
+                break
+            jobs = api(f"runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100").get("jobs")
+            ended = utc(live_job(run, jobs).get("completed_at"))
+            if ended.timestamp() < cutoff:
+                break
+            require(ended <= selected["ended"], "previous_order")
+            verify_eligible_job(run, jobs)
+            target = output / "previous" / str(kept + 1)
+            with tempfile.TemporaryDirectory(dir=output.parent) as work:
+                candidate = Path(work)
+                fetch_candidate(run, candidate)
+                target.mkdir(parents=True)
+                for file in candidate.iterdir():
+                    file.replace(target / file.name)
+            kept += 1
+        except Rejected as error:
+            if str(error) == "lookup_timeout":
+                break
+            print("V2 earlier round unavailable:", str(error), file=sys.stderr)
+
+
 def acquire(output):
     latest = None
+    selected = None
     try:
         runs = runs_to_check()
         health_known = True
@@ -266,6 +308,7 @@ def acquire(output):
                 fetch_candidate(run, candidate)
                 for file in candidate.iterdir():
                     file.replace(output / file.name)
+            selected = {"id": run["id"], "ended": ended}
             break
         except Rejected as error:
             if str(error) == "lookup_timeout":
@@ -282,6 +325,8 @@ def acquire(output):
                 runs.append(previous)
             except Rejected:
                 pass
+    if selected is not None:
+        acquire_previous(output, selected, runs, checked)
     (output / "latest.json").write_text(json.dumps(latest))
 
 
