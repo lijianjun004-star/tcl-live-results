@@ -1,11 +1,14 @@
 // Universal results page (v2): one list of every live room by store name, a tally-lamp overview, search,
 // platform and "needs a look" filters, and copy-to-record. Works without JavaScript (filters and copy need it).
-// Inputs: out/{jd,douyin,tmall,runs,samples}.json and private/names.json (optional; falls back to codes).
+// Inputs: out/{jd,douyin,tmall,runs,samples,v2}.json and private/names.json (optional; falls back to codes).
 // Output: universal/index.html. Usage: node render.mjs
 import fs from 'node:fs';
 import { assessFreshness, assessRefresh, beijingDay, isCountable, nextRefreshAfter } from './freshness.mjs';
+import { v2Rows, v2Counts, v2CardAttributes, v2SummaryLine, v2Detail, v2Overview, v2BrowserFunctions, roles } from './v2-view.mjs';
 const rd = f => JSON.parse(fs.readFileSync('out/' + f, 'utf8'));
 const jdAll = rd('jd.json').rows, dyAll = rd('douyin.json').rows, tmAll = rd('tmall.json').rows, runs = rd('runs.json').rows, S = rd('samples.json');
+const V = fs.existsSync('out/v2.json') ? rd('v2.json') : { source: null, rows: [] };
+const v2 = v2Rows(V), v2ById = new Map(v2.map(r => [r.id, r]));
 let N = {}, namesOk = true;
 try { N = JSON.parse(fs.readFileSync('private/names.json', 'utf8')).names; } catch { namesOk = false; }
 if (!jdAll.length || !dyAll.length || !tmAll.length || runs.length !== 3) throw new Error('RENDER_INPUT_EMPTY');
@@ -89,6 +92,14 @@ for (const r of [...jdAll].sort((a, b) => num(a.room) - num(b.room))) {
     room: num(code), category: r.category, conflict: inName && r.category && inName !== r.category ? inName : '' });
 }
 const by = p => R.filter(r => r.p === p);
+// Only T codes can join a ledger card. A missing ledger card gets a V2-only
+// entry. The JD candidate has no established correspondence to a JD room.
+const ledgerCodes = new Set(by('tmall').map(r => r.code));
+const v2Only = v2.filter(r => !ledgerCodes.has(r.id)).sort((a, b) => a.id.localeCompare(b.id)).map(r => ({
+  id: r.id === 'J-C01' ? 'jc01' : slug(r.id), code: r.id, p: r.platform,
+  pl: r.platform === 'jd' ? '京东' : '天猫淘宝', name: nameOf(r.id), role: roles[r.role], v2: r
+}));
+const shopCount = p => (p ? by(p).length : R.length) + v2Only.filter(r => !p || r.p === p).length;
 const seenAll = R.filter(r => r.st === 'seen').length, attnAll = R.filter(r => r.attn.length).length;
 const titleFor = count => count > 0 ? `${count} 个直播间已确认开播` : '本日暂无可确认的开播数据';
 const title = titleFor(seenAll);
@@ -130,17 +141,21 @@ const jdMore = r => {
 <li>运营平台 ${r.room} 号直播间，品类「${esc(r.category)}」${r.conflict ? `（和名称里的「${esc(r.conflict)}」不一致，待运营平台核实）` : ''}</li></ul>`;
 };
 const row = r => {
+  const sample = r.p === 'tmall' && v2ById.get(r.code);
   const tag = r.role === '考核' ? '<span class="tag">考核</span>' : '';
   const q = (r.name + ' ' + r.code + ' ' + r.pl + ' ' + (r.conflict ? '' : r.category || '')).toLowerCase().replace(/\s+/g, '');
   const extra = r.p === 'jd' ? r.attn.filter(a => a.includes('24 点')) : [];
-  return `<details class="st" id="${r.id}" data-p="${r.p}" data-a="${r.attn.length ? 1 : 0}" data-q="${esc(q)}">
-<summary><span class="nm">${esc(r.name)}${tag}</span><span class="pill snapshot-current">${K(r.st)}${esc(r.status)}</span>
+  return `<details class="st" id="${r.id}" data-p="${r.p}" data-a="${r.attn.length ? 1 : 0}" data-q="${esc(q)}"${sample ? ' ' + v2CardAttributes(sample, genMs) : ''}>
+<summary><span class="nm">${esc(r.name)}${tag}</span><span class="pill snapshot-current">${K(r.st)}${sample ? '原台账 · ' : ''}${esc(r.status)}</span>
 <span class="ln snapshot-current${r.lineWarn ? ' warn' : ''}">${r.line.split('，').map((x, i, a) => `<span class="nw">${esc(x)}${i < a.length - 1 ? '，' : ''}</span>`).join('')}</span>${r.line2 ? `<span class="ln2 snapshot-current">${esc(r.line2)}</span>` : ''}${extra.length ? `<span class="ln2 warn">${esc(extra.join('，'))}</span>` : ''}
-<span class="pill snapshot-expired">${K('unknown')}无法判断</span>
-<span class="ln warn snapshot-expired">本版观测已过期，展开查看采样记录</span><i class="chev" aria-hidden="true"></i></summary>
-<div class="more">${r.p === 'jd' ? jdMore(r) : strip(r) + (r.prev ? `<p class="fine">前一天 ${esc(r.prev)}</p>` : '')}<p class="fine">监控编号 ${esc(r.code)}</p></div>
+<span class="pill snapshot-expired">${K('unknown')}${sample ? '原台账 · ' : ''}无法判断</span>
+<span class="ln warn snapshot-expired">本版观测已过期，展开查看采样记录</span>${sample ? v2SummaryLine(sample, genMs) : ''}<i class="chev" aria-hidden="true"></i></summary>
+<div class="more">${sample ? v2Detail(sample, genMs) + '<h3>原台账</h3>' : ''}${r.p === 'jd' ? jdMore(r) : strip(r) + (r.prev ? `<p class="fine">前一天 ${esc(r.prev)}</p>` : '')}<p class="fine">监控编号 ${esc(r.code)}</p></div>
 </details>`;
 };
+const standaloneRow = r => `<details class="st" id="${r.id}" data-p="${r.p}" data-a="0" data-q="${esc((r.name + r.code + r.pl).toLowerCase().replace(/\s+/g, ''))}" ${v2CardAttributes(r.v2, genMs)}>
+<summary><span class="nm">${esc(r.name)}<span class="tag">${esc(r.role)}</span></span>${v2SummaryLine(r.v2, genMs)}<i class="chev" aria-hidden="true"></i></summary>
+<div class="more">${v2Detail(r.v2, genMs)}<p class="fine">监控编号 ${esc(r.code)} · ${r.p === 'jd' ? '店铺与原台账直播间的对应关系待核实' : '本版缺少该店原台账'}</p></div></details>`;
 const healthText = { success:'成功', failure:'失败', cancelled:'取消', timed_out:'超时', action_required:'需处理',
   skipped:'跳过', neutral:'中性', stale:'过期', startup_failure:'启动失败' };
 const group = (p, pl) => {
@@ -148,18 +163,22 @@ const group = (p, pl) => {
   const run = runBy[p], latestRun = run.latestRun;
   const attempt = runSpan(run) || '时间无法确认';
   const health = latestRun ? `<p class="fine">最近完成任务 <a href="https://github.com/lijianjun004-star/tcl-live-monitor/actions/runs/${latestRun.id}">${esc(longAt(latestRun.at))}</a> · ${esc(healthText[latestRun.conclusion] || "未知")}</p>` : '';
-  return `<section class="grp" data-p="${p}" aria-labelledby="g-${p}"><h2 id="g-${p}">${pl}<span data-current-group="${p}">${esc(groupMeta(p))}</span></h2><p class="fine">本版采用的采集尝试 ${esc(attempt)}（北京时间）</p><p class="fine">最近有效观测 ${esc(sourceAt[p] ? longAt(sourceAt[p]) : '时间无法确认')}（北京时间） · <span data-source-time="${esc(sourceAt[p] || '')}" data-age-state="${freshness.state}">${esc(freshness.text)}</span></p>${health}${by(p).map(row).join('')}</section>`;
+  return `<section class="grp" data-p="${p}" aria-labelledby="g-${p}"><h2 id="g-${p}">${pl}<span>原台账 · <span data-current-group="${p}">${esc(groupMeta(p))}</span></span></h2><p class="fine">本版采用的采集尝试 ${esc(attempt)}（北京时间）</p><p class="fine">最近有效观测 ${esc(sourceAt[p] ? longAt(sourceAt[p]) : '时间无法确认')}（北京时间） · <span data-source-time="${esc(sourceAt[p] || '')}" data-age-state="${freshness.state}">${esc(freshness.text)}</span></p>${health}${by(p).map(row).join('')}${p === 'tmall' ? v2Only.filter(r => r.p === p).map(standaloneRow).join('') : ''}</section>`;
 };
 
 // data for copy-to-record (names, results and times only)
 const recs = R.map(r => {
   const extra = r.p === 'jd' ? r.attn.filter(a => a.includes('24 点')) : [];
-  return { id: r.id, p: r.pl, name: r.name, role: r.role, status: r.status, date: r.date,
+  return { id: r.id, p: r.pl, name: r.name, role: r.role, status: r.status, date: r.date, ...(r.p === 'tmall' && v2ById.has(r.code) ? { v2: v2ById.get(r.code) } : {}),
     text: r.status + '，' + r.line + (r.line2 ? '；' + r.line2 : '') + (extra.length ? '；' + extra.join('，') : '') + '；数据截至 ' + (r.evidence.at ? isoBJ(r.evidence.at) : '时间无法确认'),
     asOfIso: r.evidence.at ? isoBJ(r.evidence.at) : '', evidence: r.evidence,
     seen: r.seen || '', start: r.startIso ? isoBJ(r.startIso) : r.start || '', seenFrom: isoBJ(r.seenFrom), seenTo: isoBJ(r.seenTo), live8: r.p === 'jd' ? (r.live8 === '是' ? '是' : r.live8 === '否' ? '否' : '') : '', minutes: r.p === 'jd' ? r.minutes : '',
     prevRate: r.p === 'jd' ? r.prevRate + (r.est ? '（估算）' : '') : '', dayRate: r.p === 'jd' ? r.dayRate : '', note: r.attn.join('；') };
 });
+for (const r of v2Only) {
+  recs.push({ id: r.id, p: r.pl, name: r.name, role: r.role, v2: r.v2, evidence: null, status: '',
+    date: '', text: '', seenFrom: '', seenTo: '', start: '', live8: '', minutes: null, dayRate: '', prevRate: '', note: '', asOfIso: '' });
+}
 const recJson = JSON.stringify({ day, head: `TCL 直播记录 ${md(day)}（${wk(day)}）`, asOf:'各平台有效观测时间见每条记录；本版页面生成于 ' + genText + '（北京时间）', asOfIso:latestIso ? isoBJ(latestIso) : '', rows:recs }).replace(/</g, '\\u003c');
 const summaryData = JSON.stringify(R.map(r => ({
   ...r.evidence, id: r.id, name: r.name, status: r.status, attention: !!r.attn.length,
@@ -272,6 +291,21 @@ h1{margin:6px 0 0;font-size:clamp(24px,6.4vw,34px);line-height:1.25;font-weight:
 .smp li{display:inline-flex;align-items:center;margin:0 14px 4px 0;white-space:nowrap}
 .smp b{margin-right:4px;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
 .fine{margin:8px 0 0;font-size:13px;color:var(--mut)}
+.v2-overview{margin:20px 0;padding:14px 16px;border:1px solid var(--line);border-radius:14px}
+.v2-overview h2{margin:0;font-size:20px}
+.v2-overview h3,.more h3{margin:12px 0 4px;font-size:15px}
+.v2-overview p,.v2-detail p{margin:4px 0;font-size:14px}
+.v2-overview summary{margin-top:8px;cursor:pointer;font-size:14px;color:var(--mut)}
+.v2-tally{display:flex;flex-wrap:wrap;gap:3px 16px;font-size:14px}
+.v2-tally b,.v2-line small,.v2-timeline time{font-variant-numeric:tabular-nums}
+.v2-line{grid-column:1/-1;display:block;margin-top:7px;font-size:14px}
+.v2-line b{color:var(--sea);margin-right:4px}
+.v2-line small{display:block;color:var(--mut);font-size:13px}
+.v2-detail{margin:0 0 12px;padding:2px 12px 8px;background:var(--plate);border-radius:8px}
+.v2-timeline{margin:8px 0;padding-left:20px;list-style:disc;font-size:14px}
+.v2-timeline li::marker{color:var(--sea)}
+.v2-filter{display:flex;align-items:center;gap:6px;margin:0 8px 8px 0;font-size:14px}
+.v2-filter select{min-height:44px;padding:0 8px;font:inherit;color:var(--ink);background:var(--wash);border:1px solid var(--line);border-radius:8px}
 [data-age-state=STALE],[data-age-state=UNKNOWN]{color:var(--warn);font-weight:600}
 .rate{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-column-gap:10px;align-items:center;font-size:13px;color:var(--mut)}
 .rate b{color:var(--ink);font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -304,19 +338,21 @@ footer{margin:18px 0 0;padding:14px 0 30px;border-top:1px solid var(--line);font
 <div class="wrap">
 <header>
 <p class="meta">${esc(md(day))} 广播日（京东 ${esc(md(jdDay))} 自然日）的直播结果。时间均为北京时间。${latestIso ? '最新有效观测 ' + esc(longAt(latestIso)) + '，平台各自时间见下。' : '当前没有可确认的观测时间。'}</p>${['douyin', 'tmall'].filter(paused).map(p => `<p class="pause">${p === 'douyin' ? '抖音' : '天猫淘宝'}：${esc(longAt(pauses[p].from))} 平台要求验证，暂停后计划 ${esc(longAt(pauses[p].until))} 复核；当前无法判断。</p>`).join('')}
-<h1 data-current-total>${esc(title)}</h1>
+<p class="fine">原台账 · 当日汇总</p><h1 data-current-total>${esc(title)}</h1>
 <p class="dek" data-current-dek data-original-dek="${esc(dek)}">${esc(dek)}</p>
 <div class="board" aria-label="本版页面收录的店铺及快照记录，点一下跳到对应店铺">
 ${[['douyin', '抖音'], ['tmall', '天猫淘宝'], ['jd', '京东']].map(([p, pl]) => `<div class="bg"><p class="bl"><b>${pl}</b><span data-current-group="${p}">${esc(groupMeta(p))}</span></p><p class="lamps">${by(p).map(lamp).join('')}</p></div>`).join('')}
 <p class="key"><span>${K('seen')}快照内已确认开播</span><span>${K('unseen')}快照内采样中未见</span><span>${K('unknown')}无法判断或过期</span><span><i class="dot" aria-hidden="true"></i>要关注&nbsp;<b data-attention-total>${attnAll}</b></span></p>
 </div>
 </header>
+${v2Overview(V.source, V.latest, V.counts, v2Counts(v2, genMs))}
 <div class="tools">
 <div class="find" role="search">
 <input id="q" type="search" placeholder="搜索店铺名称，比如 空调、雷鸟" autocomplete="off" enterkeyhint="search" aria-label="搜索店铺名称">
-<div class="seg" role="group" aria-label="按平台筛选"><button type="button" data-pf="all" aria-pressed="true">全部<span>${R.length}</span></button><button type="button" data-pf="douyin" aria-pressed="false">抖音<span>${by('douyin').length}</span></button><button type="button" data-pf="tmall" aria-pressed="false">天猫淘宝<span>${by('tmall').length}</span></button><button type="button" data-pf="jd" aria-pressed="false">京东<span>${by('jd').length}</span></button></div>
+<div class="seg" role="group" aria-label="按平台筛选">${[['all','全部'],['douyin','抖音'],['tmall','天猫淘宝'],['jd','京东']].map(([p, name]) => `<button type="button" data-pf="${p}" aria-pressed="${p === 'all'}">${name}<span>${shopCount(p === 'all' ? null : p)}</span></button>`).join('')}</div>
 </div>
-<div class="acts"><button type="button" id="attn" aria-pressed="false">只看要关注<span data-attention-total>${attnAll}</span></button><button type="button" id="cp">复制记录</button><button type="button" id="cpx">复制表格</button></div>
+<div class="acts">${v2.length ? `<label class="v2-filter">V2 状态<select id="v2-filter">
+<option value="all">全部店卡</option><option value="covered">本轮全部店铺</option><option value="live">当前有在播实证</option><option value="offline">当前有未播实证</option><option value="replay">当前有回放实证</option><option value="unknown">当前未知</option><option value="skipped">本轮跳过</option><option value="uncalibrated">本轮规则待校准</option><option value="historical">历史记录</option></select></label>` : ''}<button type="button" id="attn" aria-pressed="false">台账需关注<span data-attention-total>${attnAll}</span></button><button type="button" id="cp">复制记录</button><button type="button" id="cpx">复制表格</button></div>
 <p class="msg" id="msg" aria-live="polite"></p>
 <textarea id="fb" readonly hidden aria-label="要复制的记录"></textarea>
 <p class="empty" id="empty" hidden>没有符合条件的直播间。<button type="button" id="clr">清空搜索和筛选</button></p>
@@ -325,6 +361,7 @@ ${[['douyin', '抖音'], ['tmall', '天猫淘宝'], ['jd', '京东']].map(([p, p
 ${group('douyin', '抖音')}
 ${group('tmall', '天猫淘宝')}
 ${group('jd', '京东')}
+${v2Only.some(r => r.p === 'jd') ? `<section class="grp" data-p="jd" aria-labelledby="g-jd-candidate"><h2 id="g-jd-candidate">京东候选店</h2>${v2Only.filter(r => r.p === 'jd').map(standaloneRow).join('')}</section>` : ''}
 </main>
 <details class="about"><summary>关于这些数据</summary>
 <h3>数据时间</h3><p>抖音、天猫淘宝按北京时间 06:00 切换广播日，京东按北京时间自然日计算。页面只读取已存在的采集结果。本版采用的采集尝试、有效观测、页面生成和发布记录分别显示。GitHub 计划每小时 :03、:33 刷新，实际时间以发布记录为准。</p>
@@ -350,7 +387,31 @@ const beijingDay = ${beijingDay.toString()};
 const isCountable = ${isCountable.toString()};
 const titleFor = ${titleFor.toString()};
 const groupText = ${groupText.toString()};
+${v2BrowserFunctions}
 let refreshActiveFilter = () => {};
+const exportRecords = document.getElementById('rec');
+const records = exportRecords ? JSON.parse(exportRecords.textContent) : { rows: [] };
+const sampledCards = records.rows.filter(r => r.v2);
+function updateV2Summary(now) {
+  if (!sampledCards.length) return;
+  let changed = false;
+  const labels = new Map(Array.from(document.querySelectorAll('[data-v2-label]'), n => [n.getAttribute('data-v2-label'), n]));
+  for (const item of sampledCards) {
+    const state = v2State(item.v2, now);
+    const label = labels.get(item.v2.id);
+    if (label) label.textContent = state.label;
+    const card = document.getElementById(item.id);
+    if (!card) continue;
+    if (card.getAttribute('data-v2-age') !== state.age || card.getAttribute('data-v2-result') !== state.current) {
+      card.setAttribute('data-v2-age', state.age);
+      card.setAttribute('data-v2-result', state.current);
+      changed = true;
+    }
+  }
+  const totals = v2Counts(sampledCards.map(x => x.v2), now);
+  document.querySelectorAll('[data-v2-count]').forEach(n => { n.textContent = String(totals[n.getAttribute('data-v2-count')]); });
+  if (changed) refreshActiveFilter();
+}
 function updateCurrentSummary(evidence, now) {
   const counts = {jd:{seen:0,unknown:0},douyin:{seen:0,unknown:0},tmall:{seen:0,unknown:0}};
   const lamps = new Map(Array.from(document.querySelectorAll('[data-room-lamp]'),
@@ -407,6 +468,7 @@ function updateSourceAges() {
   });
   const element = document.getElementById('freshness-summary');
   if (element) updateCurrentSummary(JSON.parse(element.textContent), Date.now());
+  updateV2Summary(Date.now());
 }
 updateSourceAges();
 setInterval(updateSourceAges, 60000);
@@ -414,16 +476,25 @@ document.addEventListener('visibilitychange', updateSourceAges);
 {
   const doc = document.documentElement;
   doc.classList.add('js');
-  let data = { rows: [] };
-  try { data = JSON.parse(document.getElementById('rec').textContent); } catch (e) {}
+  const data = records;
   const $ = s => document.querySelector(s), $$ = s => Array.prototype.slice.call(document.querySelectorAll(s));
   const q = $('#q'), rows = $$('.st'), groups = $$('.grp'), segs = $$('[data-pf]'), attn = $('#attn'), msg = $('#msg'), fb = $('#fb'), empty = $('#empty'), cp = $('#cp'), cpx = $('#cpx');
   let pf = 'all', only = false;
+  const vf = $('#v2-filter');
+  const matchesV2 = r => {
+    if (!vf || vf.value === 'all') return true;
+    if (!r.hasAttribute('data-v2-code')) return false;
+    if (vf.value === 'covered') return true;
+    if (vf.value === 'historical') return r.dataset.v2Age === 'STALE';
+    if (vf.value === 'skipped') return r.hasAttribute('data-v2-skip');
+    if (vf.value === 'uncalibrated') return r.hasAttribute('data-v2-uncalibrated');
+    return r.dataset.v2Result === vf.value;
+  };
   const norm = s => String(s || '').toLowerCase().replace(/\\s+/g, '');
   const shown = () => rows.filter(r => !r.hidden);
   const apply = () => {
     const t = norm(q.value);
-    rows.forEach(r => { r.hidden = !((pf === 'all' || r.dataset.p === pf) && (!only || r.dataset.a === '1') && (!t || r.dataset.q.indexOf(t) >= 0)); });
+    rows.forEach(r => { r.hidden = !((pf === 'all' || r.dataset.p === pf) && (!only || r.dataset.a === '1') && matchesV2(r) && (!t || r.dataset.q.indexOf(t) >= 0)); });
     groups.forEach(g => { g.hidden = !g.querySelector('.st:not([hidden])'); });
     const n = shown().length;
     empty.hidden = n > 0;
@@ -431,33 +502,44 @@ document.addEventListener('visibilitychange', updateSourceAges);
     cp.disabled = cpx.disabled = n === 0;
     msg.textContent = ''; fb.hidden = true;
   };
-  const reset = () => { q.value = ''; pf = 'all'; only = false; segs.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.pf === 'all'))); attn.setAttribute('aria-pressed', 'false'); apply(); };
-  refreshActiveFilter = () => { if (only) apply(); };
+  const reset = () => { q.value = ''; pf = 'all'; only = false; if (vf) vf.value = 'all'; segs.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.pf === 'all'))); attn.setAttribute('aria-pressed', 'false'); apply(); };
+  refreshActiveFilter = () => { if (only || (vf && vf.value !== 'all')) apply(); };
+  if (vf) vf.addEventListener('change', apply);
   q.addEventListener('input', apply);
   segs.forEach(b => b.addEventListener('click', () => { pf = b.dataset.pf; segs.forEach(x => x.setAttribute('aria-pressed', String(x === b))); apply(); }));
   attn.addEventListener('click', () => { only = !only; attn.setAttribute('aria-pressed', String(only)); apply(); });
   $('#clr').addEventListener('click', reset);
   $$('.lamp').forEach(a => a.addEventListener('click', () => { const d = document.getElementById(a.getAttribute('href').slice(1)); if (!d) return; if (d.hidden) reset(); d.open = true; }));
   const pick = () => {
+    updateSourceAges();
     const ids = new Set(shown().map(r => r.id)), now = Date.now();
-    return data.rows.filter(x => ids.has(x.id)).map(x => isCountable(x.evidence,now) ? x : {
-      ...x, status:'无法判断', text:'当前无法判断；原版快照：' + x.text,
-      seenFrom:'', seenTo:'', start:'', live8:'', minutes:'', dayRate:''
+    return data.rows.filter(x => ids.has(x.id)).map(x => {
+      const daily = !x.evidence || isCountable(x.evidence,now) ? x : {
+        ...x, status:'无法判断', text:'当前无法判断；原版快照：' + x.text,
+        seenFrom:'', seenTo:'', start:'', live8:'', minutes:'', dayRate:''
+      };
+      return x.v2 ? { ...daily, sample: v2Export(x.v2, now) } : daily;
     });
   };
   const text = list => {
     const out = [data.head, data.asOf];
     ['抖音', '天猫淘宝', '京东'].forEach(p => {
       const g = list.filter(x => x.p === p); if (!g.length) return;
-      out.push('', p + '（' + g.length + ' 个，已开播 ' + g.filter(x => x.status === '已开播').length + '）');
-      g.forEach((x, i) => out.push((i + 1) + '. ' + x.name + (x.role === '考核' ? '〔考核〕' : '') + '：' + x.text));
+      out.push('', p + '（' + g.length + ' 个，原台账已开播 ' + g.filter(x => x.status === '已开播').length + '）');
+      g.forEach((x, i) => {
+        const daily = x.text && x.v2 ? '原台账 · ' + x.text : x.text;
+        out.push((i + 1) + '. ' + x.name + (x.role === '考核' ? '〔考核〕' : '') + '：' +
+          [daily, x.sample ? x.v2.id + ' ' + x.sample.text : ''].filter(Boolean).join('；'));
+      });
     });
     out.push('', '注：时间均为北京时间；采样约每 2 小时一次，「采样中未见」不等于没播。');
     return out.join('\\n');
   };
   const cell = v => String(v == null ? '' : v).replace(/[\\t\\n]/g, ' ');
-  const table = list => [['广播日', '平台', '店铺', '类型', '结果', '首次看到在播', '最后看到在播', '本场开始', '8点在播', '当天累计分钟', '当天满播率', '上一日满播率', '要关注', '数据截至'].join('\\t')]
-    .concat(list.map(x => [x.date, x.p, x.name, x.role, x.status, x.seenFrom, x.seenTo, x.start, x.live8, x.minutes, x.dayRate, x.prevRate, x.note, x.asOfIso].map(cell).join('\\t'))).join('\\n');
+  const table = list => [['广播日', '平台', '店铺', '类型', '原台账结果', '首次看到在播', '最后看到在播', '本场开始', '8点在播', '当天累计分钟', '当天满播率', '上一日满播率', '台账需关注', '台账数据截至',
+    'V2 编号','V2 范围','V2 本轮记录','V2 时效','V2 当前状态','V2 原因','V2 记录时间','V2 调度登记','V2 采样尝试','V2 有效观测'].join('\\t')]
+    .concat(list.map(x => [x.date, x.p, x.name, x.role, x.status, x.seenFrom, x.seenTo, x.start, x.live8, x.minutes, x.dayRate, x.prevRate, x.note, x.asOfIso,
+      x.v2?.id, x.sample?.role, x.sample?.sample, x.sample?.age, x.sample?.status, x.sample?.reason, x.sample?.recorded, x.sample?.schedule, x.sample?.attempt, x.sample?.verified].map(cell).join('\\t'))).join('\\n');
   const copy = (t, n, what) => {
     const done = () => { msg.textContent = '已复制 ' + n + ' 条' + what; fb.hidden = true; };
     const fail = () => { fb.value = t; fb.hidden = false; fb.focus(); fb.select(); try { fb.setSelectionRange(0, t.length); } catch (e) {} msg.textContent = '这里不能自动复制。下面的文字已全选，长按选择「拷贝」即可。'; };

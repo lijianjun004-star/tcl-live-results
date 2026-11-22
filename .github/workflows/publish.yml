@@ -36,14 +36,16 @@ jobs:
       # Every trigger (push, manual, schedule) rebuilds the page from the newest collector logs, so a push can
       # never put the old committed snapshot back online. If the refresh fails, the job stops here: nothing is
       # uploaded or deployed and the last good page stays online.
-      - name: Refresh from existing collector logs
+      - name: Refresh from collector logs and verified V2 evidence
         id: refresh
         env:
           GH_TOKEN: ${{ secrets.RESULTS_READ_TOKEN || github.token }}
           MAIN_DIR: ${{ runner.temp }}/results-config
+          V2_PRIVATE_DIR: ${{ runner.temp }}/v2-evidence-selected
         run: |
           bash dash/refresh.sh
           cp dash/universal/index.html docs/index.html
+          node dash/leakcheck.mjs dash/out docs
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:

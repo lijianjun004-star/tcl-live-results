@@ -1,7 +1,10 @@
 // Builds the four masked dashboard datasets from the public GitHub Actions run logs.
 // Inputs: jd.log (R327_JD_DAY), dy.log (R325_DAILY, R316_RPA), tm.log (R325_DAILY, R329_TMALL). Output: out/*.json
 import fs from 'node:fs';
+import path from 'node:path';
 import { beijingDay } from './freshness.mjs';
+import { readV2 } from './v2.mjs';
+import { legacyTmallLabels } from './tmall-labels.mjs';
 const M = (process.env.MAIN_DIR || '/tmp/mainsrc') + '/main-';   // config files fetched from main by refresh.sh
 const strip = l => l.replace(/\x1b\[[0-9;]*m/g, '').replace(/^[^\t]*\t[^\t]*\t[^ ]*Z /, '');
 const tsOf = l => (l.match(/\t[﻿]?(\d{4}-\d\d-\d\dT[\d:.]+Z) /) || [])[1] || null;
@@ -17,9 +20,8 @@ const stopLine = (lines, tag) => lines.find(l => { const s = strip(l); if (!s.st
 const pauseOf = t => t ? { from: t, until: new Date(Date.parse(t) + 24 * 3600e3).toISOString() } : null;
 
 const dyKeys = [...keysOf('config/r316-douyin-rpa-targets.json'), ...keysOf('config/r326-douyin-targets-scoring-b.json'), ...keysOf('config/r329-douyin-targets-monitor-c.json'), ...keysOf('config/r329-douyin-targets-monitor-d.json')];
-const tmKeys = JSON.parse(fs.readFileSync(M + 'probe-targets.json', 'utf8')).tmall.map(t => t.key);
+const tmLabel = legacyTmallLabels(JSON.parse(fs.readFileSync(M + 'probe-targets.json', 'utf8')).tmall);
 const dyLabel = k => { const i = dyKeys.indexOf(k); if (i < 0) throw new Error('DY_KEY_UNMAPPED'); return '#' + (i + 1); };
-const tmLabel = k => { const i = tmKeys.indexOf(k); if (i < 0) throw new Error('TM_KEY_UNMAPPED'); return 'T' + (i + 1); };
 const daily = (lines) => Object.values(Object.fromEntries(lines.map(strip).filter(l => l.startsWith('R325_DAILY {')).map(l => JSON.parse(l.slice(11)))
   .filter(d => d && typeof d.key === 'string' && /^\d{4}-\d\d-\d\d$/.test(d.date) && typeof d.samples === 'number').map(d => [d.key + '|' + d.date, d])));
 const runIds = { jd: process.env.RUN_JD || 43595261311, dy: process.env.RUN_DY || 43593315399, tm: process.env.RUN_TM || 43593317583 };
@@ -138,7 +140,24 @@ const runsRows = [
     verified: tmRecs.filter(tmVerified).length, pause: tmPause },
 ];
 if (!jdRows.length || !dyRows.length || !tmRows.length || !rpa.length || !tmRecs.length) throw new Error('EMPTY_DATASET jd=' + jdRows.length + ' dy=' + dyRows.length + ' tm=' + tmRows.length + ' rpa=' + rpa.length + ' tmRecs=' + tmRecs.length);
+const privateDir = process.env.V2_PRIVATE_DIR;
+const v2 = privateDir && fs.existsSync(path.join(privateDir, 'source.json'))
+  ? readV2(privateDir)
+  : { source: null, rows: [], counts: null };
+let latest = null;
+if (privateDir) {
+  const run = JSON.parse(fs.readFileSync(path.join(privateDir, 'latest.json'), 'utf8'));
+  if (run !== null) {
+    const at = asIso(run.at);
+    if (typeof run.runId !== 'string' || !/^[1-9]\d{0,19}$/.test(run.runId) ||
+        !Number.isSafeInteger(run.attempt) || run.attempt < 1 || !at || !runConclusions.has(run.conclusion)) {
+      throw new Error('V2_INVALID_LATEST_RUN');
+    }
+    latest = { runId: run.runId, attempt: run.attempt, at, conclusion: run.conclusion };
+  }
+}
 fs.mkdirSync('out', { recursive: true });
+fs.writeFileSync('out/v2.json', JSON.stringify({ ...v2, latest }));
 const write = (name, rows, meta) => fs.writeFileSync('out/' + name + '.json', JSON.stringify({ rows, meta }, null, 1));
 write('jd', jdRows, prov('京东：GitHub Actions 运行 ' + runIds.jd + '（jd-fullday-rate，读运营平台每日分钟数）'));
 write('douyin', dyRows, prov('抖音：GitHub Actions 运行 ' + runIds.dy + '（douyin-daily-broadcast，含前几次的 7 天台账）'));

@@ -18,4 +18,5 @@ jobs:
         with:
           node-version: '22'
       - run: node --test tests/*.test.mjs
+      - run: python3 -m unittest discover -s tests -p '*_test.py'
       - run: bash -n dash/refresh.sh
