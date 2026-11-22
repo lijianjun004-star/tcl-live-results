@@ -339,6 +339,23 @@ function project(round) {
   return createV2Projector(round.registry)(round.evidence, round.source);
 }
 
+test('scheduled and manual snapshots produce the same public projection only with matching provenance', () => {
+  const round = tenTargetRound();
+  const legacyManual = project(round);
+  for (const event of ['workflow_dispatch', 'schedule']) {
+    round.source.event = event;
+    round.evidence.summary.event = event;
+    assert.deepEqual(project(round), legacyManual);
+    round.evidence.summary.event = event === 'schedule' ? 'workflow_dispatch' : 'schedule';
+    assert.throws(() => project(round));
+  }
+  round.source.event = round.evidence.summary.event = 'pull_request';
+  assert.throws(() => project(round));
+  delete round.source.event;
+  round.evidence.summary.event = 'schedule';
+  assert.throws(() => project(round));
+});
+
 test('ten enrolled targets reconcile against the first-round shape in either input order', () => {
   const round = tenTargetRound(), model = project(round);
   assert.deepEqual(model.counts, { covered: 10, live: 0, offline: 0, replay: 0, unknown: 10, skipped: 6, uncalibrated: 0, assessedValid: 0 });
@@ -491,12 +508,18 @@ test('each V2 clock is evaluated at 180 minutes, +5 minutes and its own Beijing 
   assert.match(v2Export(skipped, at).schedule, /19:59:03$/);
 });
 
-test('rendered records join nine existing Tmall cards and isolate the JD candidate from daily totals', t => {
+test('scheduled records render on the existing cards and pass the publication privacy scan', t => {
   const round = tenTargetRound();
+  round.source.event = 'schedule';
+  round.evidence.summary.event = 'schedule';
   const v2 = { ...project(round), latest: { runId: '970004', attempt: 1, at: NOW, conclusion: 'failure' } };
   const base = fixture(t, [row('101'), row('101', PREV)], { allTmall: true });
   const f = fixture(t, [row('101'), row('101', PREV)], { round, latest: v2.latest, allTmall: true });
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dir, 'out/v2.json'))), v2);
+  const scan = spawnSync(process.execPath, [path.join(ROOT, 'dash/leakcheck.mjs'), 'out', 'universal/index.html'],
+    { cwd: f.dir, env: f.env, encoding: 'utf8' });
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.match(scan.stdout, /\bhits=0\b/);
   for (const dataset of ['jd', 'douyin', 'tmall', 'runs', 'samples']) {
     const filename = path.join('out', dataset + '.json');
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dir, filename))), JSON.parse(fs.readFileSync(path.join(base.dir, filename))));
