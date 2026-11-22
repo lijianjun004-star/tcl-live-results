@@ -269,6 +269,34 @@ export function createV2Projector(registry) {
 
 export const projectV2 = createV2Projector(roster);
 
+// Display-only continuity. When the newest round was stopped by a challenge, a login wall or a group pause,
+// a store keeps its most recent earlier verified live sample for up to 180 minutes. The newest round's own
+// status, reason and counts stay unchanged. An earlier round that settled the store any other way ends the
+// search, so a confirmed offline or an unexplained result is never skipped over.
+export const CARRY_WINDOW_MS = 180 * 60000;
+const carryReasons = new Set(['challenge', 'login', 'circuit']);
+export function carryForward(current, previous, nowMs) {
+  insist(record(current) && Array.isArray(current.rows) && Array.isArray(previous) && Number.isFinite(nowMs), 'CARRY');
+  if (!current.source) return current;
+  const older = previous.filter(model => record(model?.source) && Array.isArray(model.rows) &&
+      typeof model.source.completedAt === 'string' && model.source.completedAt < current.source.startedAt)
+    .sort((a, b) => b.source.completedAt.localeCompare(a.source.completedAt));
+  const rows = current.rows.map(row => {
+    if (row.status !== 'unknown' || !carryReasons.has(row.reason)) return row;
+    for (const model of older) {
+      const earlier = model.rows.find(r => r.id === row.id);
+      if (!earlier || (earlier.status === 'unknown' && carryReasons.has(earlier.reason))) continue;
+      const at = earlier.status === 'live' && earlier.reason === 'confirmed' ? Date.parse(earlier.verifiedAt) : NaN;
+      if (Number.isFinite(at) && nowMs - at <= CARRY_WINDOW_MS && at <= nowMs + 5 * 60000) {
+        return { ...row, carried: { verifiedAt: earlier.verifiedAt, runId: model.source.runId, attempt: model.source.attempt } };
+      }
+      break;
+    }
+    return row;
+  });
+  return { ...current, rows };
+}
+
 export function readV2(dir) {
   const read = name => {
     try { return JSON.parse(fs.readFileSync(path.join(dir, name + '.json'), 'utf8')); }

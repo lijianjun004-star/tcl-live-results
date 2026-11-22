@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { beijingDay } from './freshness.mjs';
-import { readV2 } from './v2.mjs';
+import { readV2, carryForward } from './v2.mjs';
 import { legacyTmallLabels } from './tmall-labels.mjs';
 const M = (process.env.MAIN_DIR || '/tmp/mainsrc') + '/main-';   // config files fetched from main by refresh.sh
 const strip = l => l.replace(/\x1b\[[0-9;]*m/g, '').replace(/^[^\t]*\t[^\t]*\t[^ ]*Z /, '');
@@ -141,9 +141,18 @@ const runsRows = [
 ];
 if (!jdRows.length || !dyRows.length || !tmRows.length || !rpa.length || !tmRecs.length) throw new Error('EMPTY_DATASET jd=' + jdRows.length + ' dy=' + dyRows.length + ' tm=' + tmRows.length + ' rpa=' + rpa.length + ' tmRecs=' + tmRecs.length);
 const privateDir = process.env.V2_PRIVATE_DIR;
-const v2 = privateDir && fs.existsSync(path.join(privateDir, 'source.json'))
+let v2 = privateDir && fs.existsSync(path.join(privateDir, 'source.json'))
   ? readV2(privateDir)
   : { source: null, rows: [], counts: null };
+if (v2.source) {
+  // Earlier verified rounds (fetch-v2.py previous/<n>) only feed the display-only carry-over.
+  // An unreadable earlier round is ignored; it can never replace or fail the selected round.
+  const earlierRoot = path.join(privateDir, 'previous');
+  const earlier = fs.existsSync(earlierRoot) ? fs.readdirSync(earlierRoot).filter(n => /^[1-9]$/.test(n)).flatMap(n => {
+    try { return [readV2(path.join(earlierRoot, n))]; } catch { return []; }
+  }) : [];
+  v2 = carryForward(v2, earlier, Date.now());
+}
 let latest = null;
 if (privateDir) {
   const run = JSON.parse(fs.readFileSync(path.join(privateDir, 'latest.json'), 'utf8'));

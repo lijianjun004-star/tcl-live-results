@@ -18,27 +18,38 @@ export function v2Time(value) {
 }
 
 export function v2State(row, now) {
-  const stamp = row.status === 'unknown' ? row.attemptedAt || row.recordedAt : row.verifiedAt;
-  let age = assessFreshness(stamp, now).state;
   const shift = row.platform === 'jd' ? 0 : 6;
-  if (age === 'CURRENT' && beijingDay(Date.parse(stamp), shift) !== beijingDay(now, shift)) age = 'STALE';
+  const ageOf = stamp => {
+    const state = assessFreshness(stamp, now).state;
+    return state === 'CURRENT' && beijingDay(Date.parse(stamp), shift) !== beijingDay(now, shift) ? 'STALE' : state;
+  };
+  // A carried sample (dash/v2.mjs carryForward) stands in only while it is itself current.
+  const carriedAt = row.status === 'unknown' && row.carried ? row.carried.verifiedAt : null;
+  if (carriedAt && ageOf(carriedAt) === 'CURRENT') {
+    const sample = '沿用 ' + v2Time(carriedAt).slice(11, 16) + ' 有效样本 · ' + statuses.live;
+    return { current: 'live', age: 'CURRENT', carried: true, sample, label: sample + '（最新一轮：' + reasons[row.reason] + '）',
+      reason: reasons[row.reason], role: roles[row.role] };
+  }
+  const stamp = row.status === 'unknown' ? row.attemptedAt || row.recordedAt : row.verifiedAt;
+  const age = ageOf(stamp);
   const current = age === 'CURRENT' && !row.skipped ? row.status : 'unknown';
   const sample = row.skipped ? '跳过，状态未知' : age === 'UNKNOWN' ? '无法判断' : statuses[row.status];
   const label = age === 'STALE' ? '历史记录 · ' + sample : age === 'UNKNOWN' ? '时间未确认 · ' + sample : sample;
-  return { current, age, sample, label, reason: reasons[row.reason], role: roles[row.role] };
+  return { current, age, carried: false, sample, label, reason: reasons[row.reason], role: roles[row.role] };
 }
 
 export function v2Counts(rows, now) {
   const counts = { covered: rows.length, live: 0, offline: 0, replay: 0, unknown: 0, skipped: 0,
-    uncalibrated: 0, assessedValid: 0, historical: 0 };
+    uncalibrated: 0, assessedValid: 0, historical: 0, carried: 0 };
   for (const row of rows) {
     const state = v2State(row, now);
     counts[state.current]++;
     if (state.age === 'STALE') counts.historical++;
     if (state.age !== 'CURRENT') continue;
+    if (state.carried) counts.carried++;
     if (row.skipped) counts.skipped++;
     if (row.reason === 'uncalibrated') counts.uncalibrated++;
-    if (state.current !== 'unknown' && row.role === 'assessed') counts.assessedValid++;
+    if (state.current !== 'unknown' && row.role === 'assessed' && !state.carried) counts.assessedValid++;
   }
   return counts;
 }
@@ -55,10 +66,11 @@ export function v2Export(row, now) {
   const verified = v2Time(row.verifiedAt);
   const words = ['V2 单轮观测', state.role, state.label, state.reason, event.label + ' ' + (event.at || '时间未确认')];
   if (verified) words.push('有效观测 ' + verified);
+  if (state.carried) words.push('沿用 ' + v2Time(row.carried.verifiedAt) + ' 的有效样本');
   if (row.role === 'assessed' && row.status === 'unknown') words.push('本轮无有效样本');
   return { status: statuses[state.current], sample: state.sample, age: { CURRENT: '本期', STALE: '历史', UNKNOWN: '时间未确认' }[state.age],
     role: state.role, reason: state.reason, schedule: row.skipped ? event.at : '', attempt: v2Time(row.attemptedAt), recorded: v2Time(row.recordedAt),
-    verified, text: words.join('，') };
+    verified, carried: state.carried ? v2Time(row.carried.verifiedAt) : '', text: words.join('，') };
 }
 
 export const v2BrowserFunctions = [
@@ -66,7 +78,15 @@ export const v2BrowserFunctions = [
   v2Time, v2State, v2Counts, v2Event, v2Export
 ].map(String).join('\n');
 
-const fields = ['id', 'platform', 'role', 'recordedAt', 'attemptedAt', 'verifiedAt', 'status', 'reason', 'skipped'];
+const fields = ['id', 'platform', 'role', 'recordedAt', 'attemptedAt', 'verifiedAt', 'status', 'reason', 'skipped', 'carried'];
+function carriedSample(value, row) {
+  if (value == null) return null;
+  const keys = value !== null && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value).sort().join() : '';
+  if (keys !== 'attempt,runId,verifiedAt' || row.status !== 'unknown' || !['challenge', 'login', 'circuit'].includes(row.reason) ||
+      typeof value.runId !== 'string' || !/^[1-9]\d{0,19}$/.test(value.runId) || !Number.isSafeInteger(value.attempt) || value.attempt < 1 ||
+      typeof value.verifiedAt !== 'string' || !Number.isFinite(Date.parse(value.verifiedAt))) throw new Error('V2_VIEW_CARRIED');
+  return { verifiedAt: new Date(value.verifiedAt).toISOString(), runId: value.runId, attempt: value.attempt };
+}
 export function v2Rows(input) {
   if (!Array.isArray(input.rows)) throw new Error('V2_VIEW_ROWS');
   if (!input.source && input.rows.length === 0) return [];
@@ -85,6 +105,7 @@ export function v2Rows(input) {
       else if (typeof row[key] === 'string' && Number.isFinite(Date.parse(row[key]))) row[key] = new Date(row[key]).toISOString();
       else throw new Error('V2_VIEW_TIME');
     }
+    row.carried = carriedSample(row.carried, row);
     ids.add(row.id);
     return row;
   });
@@ -93,7 +114,8 @@ export function v2Rows(input) {
 export function v2CardAttributes(row, now) {
   const state = v2State(row, now);
   return 'data-v2-code="' + row.id + '" data-v2-result="' + state.current + '" data-v2-age="' + state.age +
-    '"' + (row.skipped ? ' data-v2-skip' : '') + (row.reason === 'uncalibrated' ? ' data-v2-uncalibrated' : '');
+    '"' + (row.skipped ? ' data-v2-skip' : '') + (row.reason === 'uncalibrated' ? ' data-v2-uncalibrated' : '') +
+    (state.carried ? ' data-v2-carried' : '');
 }
 
 export function v2SummaryLine(row, now) {
@@ -110,12 +132,14 @@ export function v2Detail(row, now) {
   const point = !row.skipped && attempted && assessFreshness(row.attemptedAt, now).state !== 'UNKNOWN' ?
     '<ol class="v2-timeline"><li data-v2-point="' + row.id + '"><time datetime="' + row.attemptedAt + '">' + attempted +
       '</time> · ' + state.sample + '</li></ol>' : '';
-  return '<section class="v2-detail"><h3>V2 单轮观测</h3><p>' + state.role + ' · ' + state.reason + '</p>' + point +
+  const carried = state.carried ? '<p>最新一轮' + state.reason + '，沿用 ' + v2Time(row.carried.verifiedAt) + ' 的有效样本（运行 ' +
+    row.carried.runId + '）：' + statuses.live + '。只用于显示，不计入考核样本。</p>' : '';
+  return '<section class="v2-detail"><h3>V2 单轮观测</h3><p>' + state.role + ' · ' + state.reason + '</p>' + point + carried +
     '<p>有效观测时间 ' + (verified || '—') + (row.role === 'assessed' ? (row.status === 'unknown' ? ' · 本轮无有效样本' : ' · 本轮有效样本 1 次') : '') + '</p></section>';
 }
 
 const tallyLabels = { covered: '覆盖', live: '在播', offline: '未播', replay: '回放', unknown: '未知',
-  skipped: '其中跳过', uncalibrated: '规则待校准', assessedValid: '有效考核样本', historical: '历史记录' };
+  skipped: '其中跳过', uncalibrated: '规则待校准', assessedValid: '有效考核样本', historical: '历史记录', carried: '其中沿用' };
 export function v2Overview(source, latest, round, current) {
   const completion = { success: '成功', failure: '失败', cancelled: '取消', timed_out: '超时', action_required: '需处理',
     neutral: '中性', skipped: '跳过', stale: '过期', startup_failure: '启动失败' };
@@ -137,8 +161,9 @@ export function v2Overview(source, latest, round, current) {
   return heading + fallback + '<p class="fine">本轮采集 ' + (v2Time(source.startedAt) || '时间未确认') + ' 至 ' +
     (v2Time(source.completedAt) || '时间未确认') + (run ? ' · ' + run : '') + '</p>' +
     '<h3>本轮记录</h3><div class="v2-tally">' + metric('round', round, ['covered','live','offline','replay','unknown','skipped','uncalibrated','assessedValid']) + '</div>' +
-    '<h3>当前状态</h3><div class="v2-tally">' + metric('count', current, ['live','offline','replay','unknown','historical']) + '</div>' +
-    '<p class="fine">跳过计入未知。每个样本只说明采样时的状态。超过 3 小时或跨统计日后，该店当前状态记为未知。</p>' +
+    '<h3>当前状态</h3><div class="v2-tally">' + metric('count', current, ['live','carried','offline','replay','unknown','historical']) + '</div>' +
+    '<p class="fine">跳过计入未知。每个样本只说明采样时的状态。超过 3 小时或跨统计日后，该店当前状态记为未知。' +
+    '最新一轮遇到人机验证、需要登录或本组暂停时，沿用 3 小时内更早一轮的有效在播样本，单独标注“沿用”，不计入考核样本。</p>' +
     '<details><summary>采集运行情况</summary>' + health + '<p class="fine">所选证据 · ' + (control[source.control] || control.unresolved) +
     ' · ' + (source.stateAdvanced === true ? '已推进恢复快照' : source.stateAdvanced === false ? '未推进恢复快照' : '恢复快照状态未知') +
     '</p><p class="fine">Bark 通知 · ' + (notify[source.notification] || notify.unknown) +
